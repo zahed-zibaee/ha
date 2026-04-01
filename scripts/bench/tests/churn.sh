@@ -8,6 +8,7 @@ source "$ROOT_DIR/scripts/bench/lib/common.sh"
 : "${CHURN_RESTART_DELAY:=10}"
 : "${CHURN_PROGRESS_INTERVAL:=15}"
 : "${CHURN_SIEGE_TIMEOUT:=120}"
+: "${CHURN_KILL_GRACE:=5}"
 
 bench_defaults
 bench_parse_args "$@"
@@ -46,9 +47,19 @@ if command -v timeout >/dev/null 2>&1; then
 else
 	siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 &
 	siege_pid=$!
-	( sleep "$CHURN_SIEGE_TIMEOUT"; kill "$siege_pid" >/dev/null 2>&1 || true ) &
-	watchdog_pid=$!
 fi
+
+watchdog_pid=""
+(
+	sleep "$CHURN_SIEGE_TIMEOUT"
+	if kill -0 "$siege_pid" >/dev/null 2>&1; then
+		echo "churn: siege timeout; killing pid ${siege_pid}" | tee -a "$report"
+		kill "$siege_pid" >/dev/null 2>&1 || true
+		sleep "$CHURN_KILL_GRACE"
+		kill -9 "$siege_pid" >/dev/null 2>&1 || true
+	fi
+) &
+watchdog_pid=$!
 
 progress_pid=""
 if [[ "$CHURN_PROGRESS_INTERVAL" -gt 0 ]]; then
@@ -86,7 +97,7 @@ if [[ -n "$leader_before" && "$RESTART_STOPPED" == "true" ]]; then
 fi
 
 wait "$siege_pid" || true
-if [[ -n "${watchdog_pid:-}" ]]; then
+if [[ -n "$watchdog_pid" ]]; then
 	kill "$watchdog_pid" >/dev/null 2>&1 || true
 	wait "$watchdog_pid" >/dev/null 2>&1 || true
 fi

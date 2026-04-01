@@ -1,0 +1,84 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  ha1:
+    build: .
+    depends_on:
+      - redis
+    volumes:
+      - ./config-targets.yaml:/app/config-targets.yaml:ro
+    environment:
+      RAFT_NODE_ID: node1
+      RAFT_BIND_ADDR: "0.0.0.0:12000"
+      RAFT_ADVERTISE_ADDR: "ha1:12000"
+      RAFT_PEERS: "node2@ha2:12000,node3@ha3:12000"
+      RAFT_JOIN_ADDRS: "http://ha1:8080,http://ha2:8080,http://ha3:8080"
+      RAFT_BOOTSTRAP: "true"
+      REDIS_ADDR: "redis:6379"
+      REDIS_DB: "1"
+      #REDIS_PASSWORD: ""
+      LOG_LEVEL: "debug"
+      RAFT_LOG_LEVEL: "${LOG_LEVEL}"
+      LOG_FORMAT: "text"
+      LISTEN_ADDR: ":8080"
+      LB_STRATEGY: "random"
+      CONFIG_PATH: "/app/config-targets.yaml"
+    ports:
+      - "12000:12000"
+      - "8080:8080"
+
+  ha2:
+    build: .
+    depends_on:
+      - redis
+    volumes:
+      - ./config-targets.yaml:/app/config-targets.yaml:ro
+    environment:
+      RAFT_NODE_ID: node2
+      RAFT_BIND_ADDR: "0.0.0.0:12000"
+      RAFT_ADVERTISE_ADDR: "ha2:12000"
+      RAFT_PEERS: "node1@ha1:12000,node3@ha3:12000"
+      RAFT_JOIN_ADDRS: "http://ha1:8080,http://ha2:8080,http://ha3:8080"
+      RAFT_BOOTSTRAP: "false"
+      REDIS_ADDR: "redis:6379"
+      REDIS_DB: "1"
+      #REDIS_PASSWORD: ""
+      LOG_LEVEL: "debug"
+      RAFT_LOG_LEVEL: "${LOG_LEVEL}"
+      LOG_FORMAT: "text"
+      LISTEN_ADDR: ":8080"
+      LB_STRATEGY: "random"
+      CONFIG_PATH: "/app/config-targets.yaml"
+    ports:
+      - "12001:12000"
+      - "8081:8080"
+
+  ha3:
+    build: .
+    depends_on:
+      - redis
+    volumes:
+      - ./config-targets.yaml:/app/config-targets.yaml:ro
+    environment:
+      RAFT_NODE_ID: node3
+      RAFT_BIND_ADDR: "0.0.0.0:12000"
+      RAFT_ADVERTISE_ADDR: "ha3:12000"
+      RAFT_PEERS: "node1@ha1:12000,node2@ha2:12000"
+      RAFT_JOIN_ADDRS: "http://ha1:8080,http://ha2:8080,http://ha3:8080"
+      RAFT_BOOTSTRAP: "false"
+      REDIS_ADDR: "redis:6379"
+      REDIS_DB: "1"
+      #REDIS_PASSWORD: ""
+      LOG_LEVEL: "debug"
+      RAFT_LOG_LEVEL: "${LOG_LEVEL}"
+      LOG_FORMAT: "text"
+      LISTEN_ADDR: ":8080"
+      LB_STRATEGY: "random"
+      CONFIG_PATH: "/app/config-targets.yaml"
+    ports:
+      - "12002:12000"
+      - "8082:8080"

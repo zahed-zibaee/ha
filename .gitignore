@@ -1,0 +1,34 @@
+# Go build artifacts
+bin/
+pkg/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and test
+*.cover
+*.cov
+coverage.txt
+
+# Modules and tooling
+vendor/
+go.work
+go.work.sum
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Configurations
+config-targets.yaml

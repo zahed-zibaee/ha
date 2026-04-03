@@ -40,8 +40,26 @@ curl http://localhost:8080/health
 
 - LB cache max age is **fixed at 5s** (not configurable).
 - LB uses Redis `:up` when available. On Redis errors, it falls back to config-hydrated targets.
+- `/v1/lb` responses are **flattened**: always include `group`, `reachable`, `name`, and `error` (if any).
+- You can override LB response fields per target via `checks.<group>.lb.response_targets[].response`.
+- LB strategy supports `random`, `round-robin`, `weighted` (latency-based), and `weighted-rr` (latency-weighted round-robin). Per-group override via `checks.<group>.lb.type`.
 - `/v1/check` returns `redis_status=error` when Redis is down (no fallback payload).
 - Raft rejoin uses `POST /v1/raft/join` and `RAFT_JOIN_ADDRS`. Use `RAFT_BOOTSTRAP=true` on exactly one node to form a cluster if none exists.
+
+Example LB override:
+
+```yaml
+checks:
+  web-health:
+    lb:
+      type: round-robin
+      response_targets:
+        - name: public-health
+          response:
+            url: https://example.com/home
+            bucket: my-bucket
+            description: "Custom LB response"
+```
 
 ## Metrics (Prometheus)
 

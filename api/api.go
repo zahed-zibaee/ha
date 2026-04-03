@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -21,7 +22,7 @@ import (
 type RedisClient interface {
 	HGetAll(ctx context.Context, key string) *redis.MapStringStringCmd
 	HMGet(ctx context.Context, key string, fields ...string) *redis.SliceCmd
-	SRandMemberN(ctx context.Context, key string, count int64) *redis.StringSliceCmd
+	ZRangeWithScores(ctx context.Context, key string, start, stop int64) *redis.ZSliceCmd
 }
 
 // LeaderStatus captures current leadership state for the node.
@@ -33,11 +34,11 @@ type LeaderStatus struct {
 }
 
 // Start HTTP server.
-func Start(ctx context.Context, addr string, rdb RedisClient, lbStrategy string, targets map[string]map[string]config.Target, leaderFn func() LeaderStatus, joinFn func(id, addr string) (int, string, error)) error {
-	selector := newSelector(lbStrategy, targets)
+func Start(ctx context.Context, addr string, rdb RedisClient, lbStrategy string, targets map[string]map[string]config.Target, lbResponses map[string]map[string]map[string]any, lbTypes map[string]string, leaderFn func() LeaderStatus, joinFn func(id, addr string) (int, string, error)) error {
+	selector := newSelector(lbStrategy, targets, lbTypes)
 	mux := http.NewServeMux()
 	mux.Handle("/v1/check/", checkHandler(rdb, targets))
-	mux.Handle("/v1/lb/", lbHandler(rdb, selector, targets))
+	mux.Handle("/v1/lb/", lbHandler(rdb, selector, targets, lbResponses))
 	mux.Handle("/v1/leader", leaderHandler(leaderFn))
 	if joinFn != nil {
 		mux.Handle("/v1/raft/join", joinHandler(joinFn))
@@ -139,21 +140,7 @@ type checkResponse struct {
 	Redis   string        `json:"redis_status,omitempty"`
 }
 
-type targetConnect struct {
-	Name     string `json:"name,omitempty"`
-	URL      string `json:"url,omitempty"`
-	Endpoint string `json:"endpoint,omitempty"`
-	Bucket   string `json:"bucket,omitempty"`
-	Key      string `json:"key,omitempty"`
-	IP       string `json:"ip,omitempty"`
-}
-
-type lbResponse struct {
-	Group     string        `json:"group"`
-	Target    targetConnect `json:"target"`
-	Reachable bool          `json:"reachable"`
-	Error     string        `json:"error,omitempty"`
-}
+type lbResponse map[string]any
 
 type leaderResponse struct {
 	Leader    bool   `json:"leader"`
@@ -274,13 +261,14 @@ func healthHandler() http.Handler {
 	})
 }
 
-func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[string]config.Target) http.Handler {
+func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[string]config.Target, lbResponses map[string]map[string]map[string]any) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		group := strings.TrimPrefix(r.URL.Path, "/v1/lb/")
 		if group == "" {
 			http.Error(w, "group required", http.StatusBadRequest)
 			return
 		}
+		groupStrategy := selector.strategyForGroup(group)
 		start := time.Now()
 		path := "unknown"
 		cacheHit := false
@@ -297,12 +285,12 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 			}
 		}()
 		if cg := lbCacheGetFresh(group, lbCacheMaxAge); cg != nil {
-			pick := selector.pickHydrated(group, cg.hydratedUp, cg.hydratedAll)
+			pick := pickFromCacheGroup(group, selector, cg)
 			path = "cache"
 			cacheHit = true
 			targets = len(cg.hydratedAll)
 			reachable = len(cg.hydratedUp)
-			writeLB(w, lbResponse{Group: group, Target: toConnect(pick.TargetMeta), Reachable: pick.Reachable, Error: pick.Error})
+			writeLB(w, buildLBResponse(group, pick.Reachable, pick.Error, &pick, lbResponses))
 			return
 		}
 		if redisBackoffActive(group) {
@@ -311,15 +299,90 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 				errType = "redis_backoff"
 				targets = len(cg.hydratedAll)
 				reachable = len(cg.hydratedUp)
-				pick := selector.pickHydrated(group, cg.hydratedUp, cg.hydratedAll)
-				writeLB(w, lbResponse{Group: group, Target: toConnect(pick.TargetMeta), Reachable: pick.Reachable, Error: "redis_backoff"})
+				pick := pickFromCacheGroup(group, selector, cg)
+				writeLB(w, buildLBResponse(group, pick.Reachable, "redis_backoff", &pick, lbResponses))
 				return
 			}
 		}
 		redisCtx, cancel := context.WithTimeout(r.Context(), redisLBTimeout)
 		defer cancel()
 		var res []probeResult
-		if selector.strategy == "random" {
+		if selector.isWeighted(group) {
+			zs, err := loadUpScoresWithTimeout(redisCtx, rdb, group)
+			if err != nil {
+				markRedisDown(group)
+				warnEvery("lb:redis_up_error:"+group, 5*time.Second, "lb read failed", "group", group, "err", err)
+				path = "redis_up_error"
+				errStr = err.Error()
+				if errors.Is(err, context.DeadlineExceeded) {
+					errType = "redis_timeout"
+				} else {
+					errType = "redis_error"
+				}
+				if cg := cacheFromConfig(group, selector, index, "redis_up_error"); cg != nil {
+					path = "config_fallback"
+					targets = len(cg.hydratedAll)
+					reachable = len(cg.hydratedUp)
+					pick := pickFromCacheGroup(group, selector, cg)
+					writeLB(w, buildLBResponse(group, pick.Reachable, "redis_error: "+err.Error(), &pick, lbResponses))
+					return
+				}
+				writeLB(w, buildLBResponse(group, false, "redis_error: "+err.Error(), nil, lbResponses))
+				return
+			}
+			if len(zs) == 0 {
+				warnEvery("lb:redis_up_empty:"+group, 5*time.Second, "redis up set empty", "group", group)
+				errType = "redis_up_empty"
+				if cg := cacheFromConfig(group, selector, index, "redis_up_empty"); cg != nil {
+					path = "config_fallback"
+					targets = len(cg.hydratedAll)
+					reachable = len(cg.hydratedUp)
+					pick := pickFromCacheGroup(group, selector, cg)
+					writeLB(w, buildLBResponse(group, pick.Reachable, "redis_up_empty", &pick, lbResponses))
+					return
+				}
+				writeLB(w, buildLBResponse(group, false, "redis_up_empty", nil, lbResponses))
+				return
+			}
+			tmap := index[group]
+			hydratedUp := make([]probeResult, 0, len(zs))
+			for _, z := range zs {
+				name := fmt.Sprint(z.Member)
+				cfg, found := tmap[name]
+				if !found {
+					warnEvery("lb:missing_config:"+group, 5*time.Second, "redis up target missing config", "group", group, "target", name)
+					errType = "missing_config"
+					continue
+				}
+				hydratedUp = append(hydratedUp, probeResult{
+					Reachable:  true,
+					Target:     cfg.Name,
+					LatencyMs:  int64(z.Score),
+					TargetMeta: targetMetaFromConfig(cfg),
+				})
+			}
+			if len(hydratedUp) == 0 {
+				if cg := cacheFromConfig(group, selector, index, "missing_config"); cg != nil {
+					path = "config_fallback"
+					targets = len(cg.hydratedAll)
+					reachable = len(cg.hydratedUp)
+					pick := pickFromCacheGroup(group, selector, cg)
+					writeLB(w, buildLBResponse(group, pick.Reachable, "missing_config", &pick, lbResponses))
+					return
+				}
+				writeLB(w, buildLBResponse(group, false, "missing_config", nil, lbResponses))
+				return
+			}
+			hydratedAll := hydratedUp
+			targets = len(hydratedAll)
+			reachable = len(hydratedUp)
+			path = "redis_up_scores"
+			cg := lbCacheSet(group, groupData{all: nil, up: hydratedUp}, hydratedAll, hydratedUp)
+			pick := pickFromCacheGroup(group, selector, cg)
+			writeLB(w, buildLBResponse(group, pick.Reachable, pick.Error, &pick, lbResponses))
+			return
+		}
+		if groupStrategy == "random" {
 			if name, ok, err := loadOneUpNameWithTimeout(redisCtx, rdb, group); err != nil {
 				markRedisDown(group)
 				warnEvery("lb:redis_up_error:"+group, 5*time.Second, "lb read failed", "group", group, "err", err)
@@ -334,11 +397,11 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 					path = "config_fallback"
 					targets = len(cg.hydratedAll)
 					reachable = len(cg.hydratedUp)
-					pick := selector.pickHydrated(group, cg.hydratedUp, cg.hydratedAll)
-					writeLB(w, lbResponse{Group: group, Target: toConnect(pick.TargetMeta), Reachable: pick.Reachable, Error: "redis_error: " + err.Error()})
+					pick := pickFromCacheGroup(group, selector, cg)
+					writeLB(w, buildLBResponse(group, pick.Reachable, "redis_error: "+err.Error(), &pick, lbResponses))
 					return
 				}
-				writeLB(w, lbResponse{Group: group, Reachable: false, Error: "redis_error: " + err.Error()})
+				writeLB(w, buildLBResponse(group, false, "redis_error: "+err.Error(), nil, lbResponses))
 				return
 			} else if ok {
 				if tmap := index[group]; tmap != nil {
@@ -347,7 +410,8 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 						targets = 1
 						reachable = 1
 						cacheFromConfigWithReachable(group, selector, index, map[string]struct{}{name: {}}, "")
-						writeLB(w, lbResponse{Group: group, Target: connectFromConfig(cfg), Reachable: true})
+						pick := probeResult{Reachable: true, Target: cfg.Name, TargetMeta: targetMetaFromConfig(cfg)}
+						writeLB(w, buildLBResponse(group, true, "", &pick, lbResponses))
 						return
 					}
 					warnEvery("lb:missing_config:"+group, 5*time.Second, "redis up target missing config", "group", group, "target", name)
@@ -356,8 +420,8 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 						path = "config_fallback"
 						targets = len(cg.hydratedAll)
 						reachable = len(cg.hydratedUp)
-						pick := selector.pickHydrated(group, cg.hydratedUp, cg.hydratedAll)
-						writeLB(w, lbResponse{Group: group, Target: toConnect(pick.TargetMeta), Reachable: pick.Reachable, Error: "missing_config"})
+						pick := pickFromCacheGroup(group, selector, cg)
+						writeLB(w, buildLBResponse(group, pick.Reachable, "missing_config", &pick, lbResponses))
 						return
 					}
 				}
@@ -369,22 +433,22 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 					path = "config_fallback"
 					targets = len(cg.hydratedAll)
 					reachable = len(cg.hydratedUp)
-					pick := selector.pickHydrated(group, cg.hydratedUp, cg.hydratedAll)
-					writeLB(w, lbResponse{Group: group, Target: toConnect(pick.TargetMeta), Reachable: pick.Reachable, Error: "redis_up_empty"})
+					pick := pickFromCacheGroup(group, selector, cg)
+					writeLB(w, buildLBResponse(group, pick.Reachable, "redis_up_empty", &pick, lbResponses))
 					return
 				}
-				writeLB(w, lbResponse{Group: group, Reachable: false, Error: "redis_up_empty"})
+				writeLB(w, buildLBResponse(group, false, "redis_up_empty", nil, lbResponses))
 				return
 			}
 		}
-		if selector.strategy != "random" {
+		if groupStrategy == "round-robin" {
 			if cg := cacheFromConfig(group, selector, index, "config_only"); cg != nil {
 				path = "config_rr"
 				targets = len(cg.hydratedAll)
 				reachable = len(cg.hydratedUp)
 				errType = "config_only"
-				pick := selector.pickHydrated(group, cg.hydratedUp, cg.hydratedAll)
-				writeLB(w, lbResponse{Group: group, Target: toConnect(pick.TargetMeta), Reachable: pick.Reachable, Error: pick.Error})
+				pick := pickFromCacheGroup(group, selector, cg)
+				writeLB(w, buildLBResponse(group, pick.Reachable, pick.Error, &pick, lbResponses))
 				return
 			}
 		}
@@ -403,7 +467,7 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 				}
 				fallback := cacheGet(group)
 				if len(fallback) == 0 {
-					writeLB(w, lbResponse{Group: group, Reachable: false, Error: "redis_error: " + err.Error()})
+					writeLB(w, buildLBResponse(group, false, "redis_error: "+err.Error(), nil, lbResponses))
 					return
 				}
 				path = "cache_fallback"
@@ -417,19 +481,19 @@ func lbHandler(rdb RedisClient, selector *lbSelector, index map[string]map[strin
 		if len(res) == 0 {
 			path = "empty"
 			errType = "no_targets"
-			writeLB(w, lbResponse{Group: group, Reachable: false, Error: "no targets found"})
+			writeLB(w, buildLBResponse(group, false, "no targets found", nil, lbResponses))
 			return
 		}
 		hydratedAll := hydrate(group, res, index)
 		hydratedUp := reachableFromAll(hydratedAll)
 		targets = len(hydratedAll)
 		reachable = len(hydratedUp)
-		pick := selector.pickHydrated(group, hydratedUp, hydratedAll)
-		lbCacheSet(group, groupData{all: res, up: hydratedUp}, hydratedAll, hydratedUp)
+		cg := lbCacheSet(group, groupData{all: res, up: hydratedUp}, hydratedAll, hydratedUp)
+		pick := pickFromCacheGroup(group, selector, cg)
 		if path == "unknown" {
 			path = "hydrate"
 		}
-		writeLB(w, lbResponse{Group: group, Target: toConnect(pick.TargetMeta), Reachable: pick.Reachable, Error: pick.Error})
+		writeLB(w, buildLBResponse(group, pick.Reachable, pick.Error, &pick, lbResponses))
 	})
 }
 
@@ -465,7 +529,7 @@ func loadGroup(ctx context.Context, rdb RedisClient, group string) ([]probeResul
 	return results, nil
 }
 
-func loadOneUpName(ctx context.Context, rdb RedisClient, group string) (string, bool, error) {
+func loadUpScores(ctx context.Context, rdb RedisClient, group string) ([]redis.Z, error) {
 	select {
 	case redisSem <- struct{}{}:
 		defer func() { <-redisSem }()
@@ -473,14 +537,44 @@ func loadOneUpName(ctx context.Context, rdb RedisClient, group string) (string, 
 		slog.Debug("redis concurrency high; proceeding without waiting", "group", group)
 	}
 	upKey := "hc:" + group + ":up"
-	names, err := rdb.SRandMemberN(ctx, upKey, 1).Result()
+	return rdb.ZRangeWithScores(ctx, upKey, 0, -1).Result()
+}
+
+func loadOneUpName(ctx context.Context, rdb RedisClient, group string) (string, bool, error) {
+	zs, err := loadUpScores(ctx, rdb, group)
 	if err != nil {
 		return "", false, err
 	}
-	if len(names) == 0 {
+	if len(zs) == 0 {
 		return "", false, nil
 	}
-	return names[0], true, nil
+	pick := zs[rand.Intn(len(zs))].Member
+	name, ok := pick.(string)
+	if ok && name != "" {
+		return name, true, nil
+	}
+	return fmt.Sprint(pick), true, nil
+}
+
+func loadUpScoresWithTimeout(ctx context.Context, rdb RedisClient, group string) ([]redis.Z, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		zs  []redis.Z
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		zs, err := loadUpScores(ctx, rdb, group)
+		ch <- result{zs: zs, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case out := <-ch:
+		return out.zs, out.err
+	}
 }
 
 func loadGroupWithTimeout(ctx context.Context, rdb RedisClient, group string) ([]probeResult, error) {
@@ -535,6 +629,7 @@ var lbCache = map[string]cachedGroup{}
 const lbCacheMaxAge = 5 * time.Second
 const redisLBTimeout = 200 * time.Millisecond
 const redisBackoffTTL = 1 * time.Second
+const weightedPoolMax = 1000
 
 var redisBackoffMu sync.Mutex
 var redisBackoffUntil = map[string]time.Time{}
@@ -566,6 +661,7 @@ type cachedGroup struct {
 	data        groupData
 	hydratedAll []probeResult
 	hydratedUp  []probeResult
+	weightedUp  []probeResult
 	seenAt      time.Time
 }
 
@@ -586,10 +682,13 @@ func cacheGet(group string) []probeResult {
 	return lastCache[group]
 }
 
-func lbCacheSet(group string, data groupData, hydratedAll, hydratedUp []probeResult) {
+func lbCacheSet(group string, data groupData, hydratedAll, hydratedUp []probeResult) *cachedGroup {
+	weightedUp := buildWeightedPool(hydratedUp)
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	lbCache[group] = cachedGroup{data: data, hydratedAll: hydratedAll, hydratedUp: hydratedUp, seenAt: time.Now()}
+	cg := cachedGroup{data: data, hydratedAll: hydratedAll, hydratedUp: hydratedUp, weightedUp: weightedUp, seenAt: time.Now()}
+	lbCache[group] = cg
+	return &cg
 }
 
 func lbCacheGetFresh(group string, maxAge time.Duration) *cachedGroup {
@@ -613,6 +712,23 @@ func warnEvery(key string, interval time.Duration, msg string, args ...any) {
 	lastWarn[key] = now
 	warnMu.Unlock()
 	slog.Warn(msg, args...)
+}
+
+func pickFromCacheGroup(group string, selector *lbSelector, cg *cachedGroup) probeResult {
+	if cg == nil {
+		return probeResult{}
+	}
+	if selector.isWeighted(group) {
+		pool := cg.weightedUp
+		if len(pool) == 0 {
+			pool = cg.hydratedUp
+			if len(pool) == 0 {
+				pool = cg.hydratedAll
+			}
+		}
+		return selector.pickFromPool(group, pool)
+	}
+	return selector.pickHydrated(group, cg.hydratedUp, cg.hydratedAll)
 }
 
 func cacheFromConfig(group string, selector *lbSelector, index map[string]map[string]config.Target, errMsg string) *cachedGroup {
@@ -657,7 +773,7 @@ func cacheFromConfigWithReachable(group string, selector *lbSelector, index map[
 			hydratedUp = append(hydratedUp, pr)
 		}
 	}
-	cg := cachedGroup{data: groupData{}, hydratedAll: hydratedAll, hydratedUp: hydratedUp, seenAt: time.Now()}
+	cg := cachedGroup{data: groupData{}, hydratedAll: hydratedAll, hydratedUp: hydratedUp, weightedUp: buildWeightedPool(hydratedUp), seenAt: time.Now()}
 	cacheMu.Lock()
 	lbCache[group] = cg
 	cacheMu.Unlock()
@@ -691,6 +807,75 @@ func reachableFromAll(all []probeResult) []probeResult {
 	return out
 }
 
+func latencyWeight(latencyMs int64) int {
+	switch {
+	case latencyMs >= 1000:
+		return 1
+	case latencyMs >= 900:
+		return 2
+	case latencyMs >= 800:
+		return 3
+	case latencyMs >= 700:
+		return 4
+	case latencyMs >= 600:
+		return 5
+	case latencyMs >= 500:
+		return 6
+	case latencyMs >= 400:
+		return 7
+	case latencyMs >= 300:
+		return 8
+	case latencyMs >= 200:
+		return 9
+	default:
+		return 10
+	}
+}
+
+func buildWeightedPool(up []probeResult) []probeResult {
+	if len(up) == 0 {
+		return nil
+	}
+	totalWeight := 0
+	weights := make([]int, len(up))
+	for i, pr := range up {
+		w := latencyWeight(pr.LatencyMs)
+		weights[i] = w
+		totalWeight += w
+	}
+	if totalWeight == 0 {
+		return nil
+	}
+	targetTotal := totalWeight
+	if targetTotal > weightedPoolMax {
+		targetTotal = weightedPoolMax
+	}
+	pool := make([]probeResult, 0, targetTotal)
+	assigned := 0
+	for i, pr := range up {
+		w := weights[i]
+		portion := (w * targetTotal) / totalWeight
+		if portion == 0 {
+			portion = 1
+		}
+		if assigned+portion > targetTotal {
+			portion = targetTotal - assigned
+		}
+		for j := 0; j < portion; j++ {
+			pool = append(pool, pr)
+		}
+		assigned += portion
+		if assigned >= targetTotal {
+			break
+		}
+	}
+	for assigned < targetTotal {
+		pool = append(pool, up[assigned%len(up)])
+		assigned++
+	}
+	return pool
+}
+
 // Selector
 
 type lbSelector struct {
@@ -699,11 +884,12 @@ type lbSelector struct {
 	counter  map[string]int
 	targets  map[string]map[string]config.Target
 	ordered  map[string][]string
+	perGroup map[string]string
 }
 
-func newSelector(strategy string, targets map[string]map[string]config.Target) *lbSelector {
-	s := strings.ToLower(strategy)
-	if s != "round-robin" && s != "roundrobin" && s != "rr" {
+func newSelector(strategy string, targets map[string]map[string]config.Target, perGroup map[string]string) *lbSelector {
+	s := normalizeStrategy(strategy)
+	if s == "" {
 		s = "random"
 	}
 	ordered := make(map[string][]string, len(targets))
@@ -715,15 +901,52 @@ func newSelector(strategy string, targets map[string]map[string]config.Target) *
 		sort.Strings(names)
 		ordered[group] = names
 	}
-	return &lbSelector{strategy: s, counter: make(map[string]int), targets: targets, ordered: ordered}
+	normalized := make(map[string]string, len(perGroup))
+	for group, st := range perGroup {
+		if ns := normalizeStrategy(st); ns != "" {
+			normalized[group] = ns
+		}
+	}
+	return &lbSelector{strategy: s, counter: make(map[string]int), targets: targets, ordered: ordered, perGroup: normalized}
+}
+
+func normalizeStrategy(strategy string) string {
+	s := strings.ToLower(strategy)
+	switch s {
+	case "round-robin", "roundrobin", "rr":
+		return "round-robin"
+	case "random":
+		return "random"
+	case "weighted", "weighted-latency", "latency":
+		return "weighted"
+	case "weighted-rr", "weighted-round-robin", "weighted_round_robin", "weightedrr":
+		return "weighted-rr"
+	default:
+		return ""
+	}
+}
+
+func (s *lbSelector) strategyForGroup(group string) string {
+	if st, ok := s.perGroup[group]; ok && st != "" {
+		return st
+	}
+	return s.strategy
+}
+
+func (s *lbSelector) isWeighted(group string) bool {
+	st := s.strategyForGroup(group)
+	return st == "weighted" || st == "weighted-rr"
 }
 
 func (s *lbSelector) pickHydrated(group string, reachable, all []probeResult) probeResult {
 	if len(reachable) == 0 {
 		return all[0]
 	}
-	if s.strategy == "random" {
+	switch s.strategyForGroup(group) {
+	case "random":
 		return reachable[rand.Intn(len(reachable))]
+	case "weighted":
+		return pickWeightedLatency(reachable)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -732,15 +955,48 @@ func (s *lbSelector) pickHydrated(group string, reachable, all []probeResult) pr
 	return reachable[idx]
 }
 
-func toConnect(tm targetMeta) targetConnect {
-	return targetConnect{
-		Name:     tm.Name,
-		URL:      tm.URL,
-		Endpoint: tm.Endpoint,
-		Bucket:   tm.Bucket,
-		Key:      tm.Key,
-		IP:       tm.IP,
+func (s *lbSelector) pickFromPool(group string, pool []probeResult) probeResult {
+	if len(pool) == 0 {
+		return probeResult{}
 	}
+	switch s.strategyForGroup(group) {
+	case "weighted-rr":
+		s.mu.Lock()
+		idx := s.counter[group] % len(pool)
+		s.counter[group]++
+		s.mu.Unlock()
+		return pool[idx]
+	default:
+		return pool[rand.Intn(len(pool))]
+	}
+}
+
+func pickWeightedLatency(reachable []probeResult) probeResult {
+	if len(reachable) == 1 {
+		return reachable[0]
+	}
+	total := 0.0
+	weights := make([]float64, len(reachable))
+	for i, r := range reachable {
+		w := 1.0
+		if r.LatencyMs > 0 {
+			w = 1.0 / float64(r.LatencyMs)
+		}
+		weights[i] = w
+		total += w
+	}
+	if total <= 0 {
+		return reachable[rand.Intn(len(reachable))]
+	}
+	roll := rand.Float64() * total
+	acc := 0.0
+	for i, w := range weights {
+		acc += w
+		if roll <= acc {
+			return reachable[i]
+		}
+	}
+	return reachable[len(reachable)-1]
 }
 
 func targetMetaFromConfig(cfg config.Target) targetMeta {
@@ -754,6 +1010,60 @@ func targetMetaFromConfig(cfg config.Target) targetMeta {
 	}
 }
 
-func connectFromConfig(cfg config.Target) targetConnect {
-	return toConnect(targetMetaFromConfig(cfg))
+func buildLBResponse(group string, reachable bool, errMsg string, pick *probeResult, overrides map[string]map[string]map[string]any) lbResponse {
+	resp := lbResponse{
+		"group":     group,
+		"reachable": reachable,
+	}
+	if errMsg != "" {
+		resp["error"] = errMsg
+	}
+
+	name := ""
+	var meta targetMeta
+	if pick != nil {
+		if pick.TargetMeta.Name != "" {
+			name = pick.TargetMeta.Name
+		} else {
+			name = pick.Target
+		}
+		meta = pick.TargetMeta
+	}
+
+	if name != "" && overrides != nil {
+		if g := overrides[group]; g != nil {
+			if ov, ok := g[name]; ok && ov != nil {
+				for k, v := range ov {
+					if k == "group" || k == "reachable" || k == "error" {
+						continue
+					}
+					resp[k] = v
+				}
+				if v, ok := resp["name"]; !ok {
+					resp["name"] = name
+				} else if s, ok := v.(string); ok && s == "" {
+					resp["name"] = name
+				}
+				return resp
+			}
+		}
+	}
+
+	resp["name"] = name
+	if meta.URL != "" {
+		resp["url"] = meta.URL
+	}
+	if meta.Endpoint != "" {
+		resp["endpoint"] = meta.Endpoint
+	}
+	if meta.Bucket != "" {
+		resp["bucket"] = meta.Bucket
+	}
+	if meta.Key != "" {
+		resp["key"] = meta.Key
+	}
+	if meta.IP != "" {
+		resp["ip"] = meta.IP
+	}
+	return resp
 }

@@ -35,40 +35,55 @@ type CheckConfig struct {
 	JitterPct     int           `yaml:"-"` // auto-set
 	StartTogether bool          `yaml:"startTogether"`
 	Targets       []Target      `yaml:"targets"`
+	LB            LBConfig      `yaml:"lb"`
+}
+
+// LBConfig controls load balancer response behavior.
+// Defaults: random selection; when response_targets is empty, /v1/lb uses target meta fields as the response.
+type LBConfig struct {
+	Type            string             `yaml:"type"`
+	ResponseTargets []LBResponseTarget `yaml:"response_targets"`
+	LegacyTargets   []LBResponseTarget `yaml:"responseTargets"`
+}
+
+// LBResponseTarget customizes /v1/lb response for a target name.
+type LBResponseTarget struct {
+	Name     string         `yaml:"name"`
+	Response map[string]any `yaml:"response"`
 }
 
 // Target is a union of fields used by all probe types.
 type Target struct {
-	Name         string        `yaml:"name"`
-	Interval     time.Duration `yaml:"interval"`
-	Timeout      time.Duration `yaml:"timeout"`
-	RedisTTL     time.Duration `yaml:"redisTTL"`
-	Retry        int           `yaml:"retry"`
-	JitterPct    int           `yaml:"-"`        // auto-set
-	Endpoint     string        `yaml:"endpoint"` // S3-compatible + object/bucket
-	Bucket       string        `yaml:"bucket"`   // S3-compatible
-	Key          string        `yaml:"key"`      // S3-compatible object
-	URL          string        `yaml:"url"`      // HTTP
-	ExpectStatus StatusList    `yaml:"response"` // HTTP expected statuses
-	Method       string        `yaml:"method"`           // HTTP method
-	Headers      map[string]string `yaml:"headers"`       // HTTP headers
-	AuthBasicUser string       `yaml:"auth_basic_user"`  // HTTP basic auth user
-	AuthBasicPass string       `yaml:"auth_basic_pass"`  // HTTP basic auth pass
-	AuthBearer   string        `yaml:"auth_bearer"`      // HTTP bearer token
-	FollowRedirects *bool      `yaml:"follow_redirects"` // HTTP follow redirects
-	MaxRedirects int           `yaml:"max_redirects"`    // HTTP redirect limit
-	Addr         string        `yaml:"addr"`     // TCP/TLS/gRPC
-	Hostname     string        `yaml:"hostname"` // DNS
-	Record       string        `yaml:"record"`   // DNS record type
-	Resolver     string        `yaml:"resolver"` // DNS custom resolver
-	Host         string        `yaml:"host"`     // ICMP ping
-	PacketSize   int           `yaml:"packet_size"`
-	MinValidDays int           `yaml:"min_valid_days"` // TLS cert
-	Service      string        `yaml:"service"`        // gRPC health service
-	Region       string        `yaml:"region"`         // S3-compatible
-	AccessKey    string        `yaml:"access_key"`     // S3-compatible
-	SecretKey    string        `yaml:"secret_key"`     // S3-compatible
-	UsePathStyle bool          `yaml:"use_path_style"` // S3-compatible
+	Name            string            `yaml:"name"`
+	Interval        time.Duration     `yaml:"interval"`
+	Timeout         time.Duration     `yaml:"timeout"`
+	RedisTTL        time.Duration     `yaml:"redisTTL"`
+	Retry           int               `yaml:"retry"`
+	JitterPct       int               `yaml:"-"`                // auto-set
+	Endpoint        string            `yaml:"endpoint"`         // S3-compatible + object/bucket
+	Bucket          string            `yaml:"bucket"`           // S3-compatible
+	Key             string            `yaml:"key"`              // S3-compatible object
+	URL             string            `yaml:"url"`              // HTTP
+	ExpectStatus    StatusList        `yaml:"response"`         // HTTP expected statuses
+	Method          string            `yaml:"method"`           // HTTP method
+	Headers         map[string]string `yaml:"headers"`          // HTTP headers
+	AuthBasicUser   string            `yaml:"auth_basic_user"`  // HTTP basic auth user
+	AuthBasicPass   string            `yaml:"auth_basic_pass"`  // HTTP basic auth pass
+	AuthBearer      string            `yaml:"auth_bearer"`      // HTTP bearer token
+	FollowRedirects *bool             `yaml:"follow_redirects"` // HTTP follow redirects
+	MaxRedirects    int               `yaml:"max_redirects"`    // HTTP redirect limit
+	Addr            string            `yaml:"addr"`             // TCP/TLS/gRPC
+	Hostname        string            `yaml:"hostname"`         // DNS
+	Record          string            `yaml:"record"`           // DNS record type
+	Resolver        string            `yaml:"resolver"`         // DNS custom resolver
+	Host            string            `yaml:"host"`             // ICMP ping
+	PacketSize      int               `yaml:"packet_size"`
+	MinValidDays    int               `yaml:"min_valid_days"` // TLS cert
+	Service         string            `yaml:"service"`        // gRPC health service
+	Region          string            `yaml:"region"`         // S3-compatible
+	AccessKey       string            `yaml:"access_key"`     // S3-compatible
+	SecretKey       string            `yaml:"secret_key"`     // S3-compatible
+	UsePathStyle    bool              `yaml:"use_path_style"` // S3-compatible
 }
 
 // StatusList allows YAML scalar "200,201" or a YAML sequence of ints.
@@ -245,6 +260,25 @@ func validate(cfg *Config) error {
 
 			if err := validateTargetByType(chk.Type, groupName, t); err != nil {
 				return err
+			}
+		}
+		if len(chk.LB.LegacyTargets) > 0 {
+			return fmt.Errorf("check %q: lb.responseTargets is not supported; use response_targets", groupName)
+		}
+		for i, rt := range chk.LB.ResponseTargets {
+			if strings.TrimSpace(rt.Name) == "" {
+				return fmt.Errorf("check %q: lb.response_targets[%d].name is required", groupName, i)
+			}
+			if rt.Response == nil {
+				return fmt.Errorf("check %q: lb.response_targets[%d].response is required", groupName, i)
+			}
+		}
+		if chk.LB.Type != "" {
+			st := strings.ToLower(strings.TrimSpace(chk.LB.Type))
+			switch st {
+			case "random", "round-robin", "roundrobin", "rr", "weighted", "weighted-latency", "latency", "weighted-rr", "weighted-round-robin", "weighted_round_robin", "weightedrr":
+			default:
+				return fmt.Errorf("check %q: lb.type %q is invalid", groupName, chk.LB.Type)
 			}
 		}
 	}

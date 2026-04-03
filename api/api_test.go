@@ -16,7 +16,35 @@ import (
 type fakeRedis struct {
 	hash   map[string]map[string]string
 	set    map[string][]string
+	zset   map[string]map[string]float64
 	getErr error
+}
+
+func decodeLB(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var resp map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp
+}
+
+func lbString(resp map[string]any, key string) string {
+	if v, ok := resp[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func lbBool(resp map[string]any, key string) bool {
+	if v, ok := resp[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
 }
 
 func TestLoadGroupReturnsResults(t *testing.T) {
@@ -42,7 +70,7 @@ func TestLoadGroupReturnsResults(t *testing.T) {
 
 func TestLBHandlerChoosesReachable(t *testing.T) {
 	rdb := &fakeRedis{
-		set: map[string][]string{"hc:g:up": {"up"}},
+		zset: map[string]map[string]float64{"hc:g:up": {"up": 10}},
 	}
 	index := map[string]map[string]config.Target{
 		"g": {
@@ -53,18 +81,55 @@ func TestLBHandlerChoosesReachable(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
 	rr := httptest.NewRecorder()
-	selector := newSelector("random", index)
-	lbHandler(rdb, selector, index).ServeHTTP(rr, req)
+	selector := newSelector("random", index, nil)
+	lbHandler(rdb, selector, index, nil).ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d", rr.Code)
 	}
-	var resp lbResponse
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Target.Name != "up" || resp.Target.URL != "https://up" || !resp.Reachable {
+	resp := decodeLB(t, rr)
+	if lbString(resp, "name") != "up" || lbString(resp, "url") != "https://up" || !lbBool(resp, "reachable") {
 		t.Fatalf("unexpected resp: %#v", resp)
+	}
+}
+
+func TestLBResponseOverrideReplacesTargetData(t *testing.T) {
+	clearCaches()
+	rdb := &fakeRedis{
+		zset: map[string]map[string]float64{"hc:g:up": {"t1": 5}},
+	}
+	index := map[string]map[string]config.Target{
+		"g": {
+			"t1": {Name: "t1", URL: "https://original"},
+		},
+	}
+	overrides := map[string]map[string]map[string]any{
+		"g": {
+			"t1": {
+				"url":         "https://override",
+				"bucket":      "b1",
+				"description": "custom",
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
+	rr := httptest.NewRecorder()
+	selector := newSelector("random", index, nil)
+	lbHandler(rdb, selector, index, overrides).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d", rr.Code)
+	}
+	resp := decodeLB(t, rr)
+	if lbString(resp, "name") != "t1" {
+		t.Fatalf("expected name t1, got %#v", resp)
+	}
+	if lbString(resp, "url") != "https://override" {
+		t.Fatalf("expected override url, got %#v", resp)
+	}
+	if lbString(resp, "bucket") != "b1" || lbString(resp, "description") != "custom" {
+		t.Fatalf("expected override fields, got %#v", resp)
 	}
 }
 
@@ -118,16 +183,13 @@ func TestLBUsesCacheOnRedisError(t *testing.T) {
 	index := map[string]map[string]config.Target{
 		"g": {"ok": {Name: "ok", URL: "https://ok"}},
 	}
-	selector := newSelector("random", index)
-	lbHandler(rdb, selector, index).ServeHTTP(rr, req)
+	selector := newSelector("random", index, nil)
+	lbHandler(rdb, selector, index, nil).ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d", rr.Code)
 	}
-	var resp lbResponse
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Target.Name != "ok" || resp.Target.URL != "https://ok" || !resp.Reachable {
+	resp := decodeLB(t, rr)
+	if lbString(resp, "name") != "ok" || lbString(resp, "url") != "https://ok" || !lbBool(resp, "reachable") {
 		t.Fatalf("unexpected resp: %#v", resp)
 	}
 }
@@ -135,7 +197,7 @@ func TestLBUsesCacheOnRedisError(t *testing.T) {
 func TestLBConfigFallbackRoundRobin(t *testing.T) {
 	clearCaches()
 	rdb := &fakeRedis{
-		set: map[string][]string{"hc:g:up": {}},
+		zset: map[string]map[string]float64{"hc:g:up": {}},
 	}
 	index := map[string]map[string]config.Target{
 		"g": {
@@ -143,8 +205,8 @@ func TestLBConfigFallbackRoundRobin(t *testing.T) {
 			"a": {Name: "a", URL: "https://a"},
 		},
 	}
-	selector := newSelector("round-robin", index)
-	handler := lbHandler(rdb, selector, index)
+	selector := newSelector("round-robin", index, nil)
+	handler := lbHandler(rdb, selector, index, nil)
 
 	req1 := httptest.NewRequest("GET", "/v1/lb/g", nil)
 	rr1 := httptest.NewRecorder()
@@ -152,11 +214,8 @@ func TestLBConfigFallbackRoundRobin(t *testing.T) {
 	if rr1.Code != http.StatusOK {
 		t.Fatalf("status %d", rr1.Code)
 	}
-	var resp1 lbResponse
-	if err := json.NewDecoder(rr1.Body).Decode(&resp1); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp1.Target.Name != "a" {
+	resp1 := decodeLB(t, rr1)
+	if lbString(resp1, "name") != "a" {
 		t.Fatalf("expected first target a, got %#v", resp1)
 	}
 
@@ -166,11 +225,8 @@ func TestLBConfigFallbackRoundRobin(t *testing.T) {
 	if rr2.Code != http.StatusOK {
 		t.Fatalf("status %d", rr2.Code)
 	}
-	var resp2 lbResponse
-	if err := json.NewDecoder(rr2.Body).Decode(&resp2); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp2.Target.Name != "b" {
+	resp2 := decodeLB(t, rr2)
+	if lbString(resp2, "name") != "b" {
 		t.Fatalf("expected second target b, got %#v", resp2)
 	}
 }
@@ -178,7 +234,7 @@ func TestLBConfigFallbackRoundRobin(t *testing.T) {
 func TestLBConfigFallbackMissingConfig(t *testing.T) {
 	clearCaches()
 	rdb := &fakeRedis{
-		set: map[string][]string{"hc:g:up": {"ghost"}},
+		zset: map[string]map[string]float64{"hc:g:up": {"ghost": 1}},
 	}
 	index := map[string]map[string]config.Target{
 		"g": {
@@ -186,24 +242,22 @@ func TestLBConfigFallbackMissingConfig(t *testing.T) {
 			"b": {Name: "b", URL: "https://b"},
 		},
 	}
-	selector := newSelector("random", index)
+	selector := newSelector("random", index, nil)
 	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
 	rr := httptest.NewRecorder()
-	lbHandler(rdb, selector, index).ServeHTTP(rr, req)
+	lbHandler(rdb, selector, index, nil).ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d", rr.Code)
 	}
-	var resp lbResponse
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Target.Name != "a" && resp.Target.Name != "b" {
+	resp := decodeLB(t, rr)
+	name := lbString(resp, "name")
+	if name != "a" && name != "b" {
 		t.Fatalf("unexpected target: %#v", resp)
 	}
-	if resp.Reachable {
+	if lbBool(resp, "reachable") {
 		t.Fatalf("expected reachable=false, got %#v", resp)
 	}
-	if resp.Error != "missing_config" {
+	if lbString(resp, "error") != "missing_config" {
 		t.Fatalf("expected missing_config error, got %#v", resp)
 	}
 }
@@ -211,7 +265,7 @@ func TestLBConfigFallbackMissingConfig(t *testing.T) {
 func TestLBConfigFallbackRedisUpEmpty(t *testing.T) {
 	clearCaches()
 	rdb := &fakeRedis{
-		set: map[string][]string{"hc:g:up": {}},
+		zset: map[string]map[string]float64{"hc:g:up": {}},
 	}
 	index := map[string]map[string]config.Target{
 		"g": {
@@ -219,24 +273,22 @@ func TestLBConfigFallbackRedisUpEmpty(t *testing.T) {
 			"b": {Name: "b", URL: "https://b"},
 		},
 	}
-	selector := newSelector("random", index)
+	selector := newSelector("random", index, nil)
 	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
 	rr := httptest.NewRecorder()
-	lbHandler(rdb, selector, index).ServeHTTP(rr, req)
+	lbHandler(rdb, selector, index, nil).ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d", rr.Code)
 	}
-	var resp lbResponse
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Target.Name != "a" && resp.Target.Name != "b" {
+	resp := decodeLB(t, rr)
+	name := lbString(resp, "name")
+	if name != "a" && name != "b" {
 		t.Fatalf("unexpected target: %#v", resp)
 	}
-	if resp.Reachable {
+	if lbBool(resp, "reachable") {
 		t.Fatalf("expected reachable=false, got %#v", resp)
 	}
-	if resp.Error != "redis_up_empty" {
+	if lbString(resp, "error") != "redis_up_empty" {
 		t.Fatalf("expected redis_up_empty error, got %#v", resp)
 	}
 }
@@ -250,24 +302,22 @@ func TestLBConfigFallbackRedisUpError(t *testing.T) {
 			"b": {Name: "b", URL: "https://b"},
 		},
 	}
-	selector := newSelector("random", index)
+	selector := newSelector("random", index, nil)
 	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
 	rr := httptest.NewRecorder()
-	lbHandler(rdb, selector, index).ServeHTTP(rr, req)
+	lbHandler(rdb, selector, index, nil).ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d", rr.Code)
 	}
-	var resp lbResponse
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Target.Name != "a" && resp.Target.Name != "b" {
+	resp := decodeLB(t, rr)
+	name := lbString(resp, "name")
+	if name != "a" && name != "b" {
 		t.Fatalf("unexpected target: %#v", resp)
 	}
-	if resp.Reachable {
+	if lbBool(resp, "reachable") {
 		t.Fatalf("expected reachable=false, got %#v", resp)
 	}
-	if !strings.Contains(resp.Error, "redis_error: boom") {
+	if !strings.Contains(lbString(resp, "error"), "redis_error: boom") {
 		t.Fatalf("expected redis_error, got %#v", resp)
 	}
 }
@@ -275,7 +325,7 @@ func TestLBConfigFallbackRedisUpError(t *testing.T) {
 func TestLBRedisUpSeedsCache(t *testing.T) {
 	clearCaches()
 	rdb := &fakeRedis{
-		set: map[string][]string{"hc:g:up": {"a"}},
+		zset: map[string]map[string]float64{"hc:g:up": {"a": 3}},
 	}
 	index := map[string]map[string]config.Target{
 		"g": {
@@ -283,10 +333,10 @@ func TestLBRedisUpSeedsCache(t *testing.T) {
 			"b": {Name: "b", URL: "https://b"},
 		},
 	}
-	selector := newSelector("random", index)
+	selector := newSelector("random", index, nil)
 	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
 	rr := httptest.NewRecorder()
-	lbHandler(rdb, selector, index).ServeHTTP(rr, req)
+	lbHandler(rdb, selector, index, nil).ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d", rr.Code)
 	}
@@ -297,15 +347,12 @@ func TestLBRedisUpSeedsCache(t *testing.T) {
 	rdbErr := &fakeRedis{getErr: assertErr("boom")}
 	req2 := httptest.NewRequest("GET", "/v1/lb/g", nil)
 	rr2 := httptest.NewRecorder()
-	lbHandler(rdbErr, selector, index).ServeHTTP(rr2, req2)
+	lbHandler(rdbErr, selector, index, nil).ServeHTTP(rr2, req2)
 	if rr2.Code != http.StatusOK {
 		t.Fatalf("status %d", rr2.Code)
 	}
-	var resp lbResponse
-	if err := json.NewDecoder(rr2.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Target.Name != "a" || !resp.Reachable {
+	resp := decodeLB(t, rr2)
+	if lbString(resp, "name") != "a" || !lbBool(resp, "reachable") {
 		t.Fatalf("expected cached a reachable, got %#v", resp)
 	}
 }
@@ -381,5 +428,29 @@ func (f *fakeRedis) SRandMemberN(ctx context.Context, key string, count int64) *
 		res = res[:count]
 	}
 	cmd.SetVal(res)
+	return cmd
+}
+
+func (f *fakeRedis) ZRangeWithScores(ctx context.Context, key string, start, stop int64) *redis.ZSliceCmd {
+	cmd := redis.NewZSliceCmd(ctx)
+	if f.getErr != nil {
+		cmd.SetErr(f.getErr)
+		return cmd
+	}
+	var out []redis.Z
+	if f.zset != nil {
+		if zs, ok := f.zset[key]; ok {
+			for member, score := range zs {
+				out = append(out, redis.Z{Member: member, Score: score})
+			}
+		}
+	} else if f.set != nil {
+		if ss, ok := f.set[key]; ok {
+			for _, member := range ss {
+				out = append(out, redis.Z{Member: member, Score: 1})
+			}
+		}
+	}
+	cmd.SetVal(out)
 	return cmd
 }

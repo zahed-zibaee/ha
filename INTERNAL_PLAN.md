@@ -33,11 +33,13 @@ Working doc for building a Raft-backed HA health-check service in Go. Audience: 
 ## Redis Interaction
 - Library: `github.com/redis/go-redis/v9` tuned for HA: pool size 100, read timeout 1s, write timeout 500ms; semaphore 256 to avoid local stampede.
 - Storage: Hash per group `hc:{group}`; field=`target name`; value JSON `{reachable,status,checked_at,error,latency_ms,type,target}` (target name only). Connection data is hydrated from in-process config map to keep payloads small.
-- Up set: `hc:{group}:up` contains reachable target names (SRANDMEMBER fast path) and expires with the hash.
+- Up set: `hc:{group}:up` is a **sorted set** keyed by target name with score=latency_ms (lower is better). Used for fast-path selection and weighting; expires with the hash. Weighted selection builds a latency-bucketed pool (1–10) capped at 1000 entries.
 - LB behavior:
   - Cache-first (max age fixed at **5s**, not configurable).
-  - If cache stale: use `:up` SRANDMEMBER(1) when available, else `HGETALL`.
+  - If cache stale: use `:up` fast path when available (ZSET), else `HGETALL`.
   - On Redis errors: short backoff and fallback to config-hydrated targets.
+  - `/v1/lb` responses are flattened (`group`, `reachable`, `name`, `error` + optional fields).
+  - Response overrides are configured via `lb.response_targets[].response` and replace target data fields.
 - `/v1/check` returns `redis_status=error` when Redis is down (no fallback payload).
 
 ## Health Check Types (Current Implementation)
@@ -80,6 +82,14 @@ checks:
         url: https://example.com/redirect
         follow_redirects: false
         response: 302
+    lb:
+      type: round-robin
+      response_targets:
+        - name: public-health
+          response:
+            url: https://example.com/home
+            bucket: my-bucket
+            description: "Custom LB response for public-health"
 ```
 
 Defaults:
@@ -97,9 +107,11 @@ Defaults:
 - Server has read/write/idle timeouts and header limits.
 - `/v1/check/{group}`: Reads hash and hydrates from local config; on Redis error returns `redis_status=error` and message.
 - `/v1/lb/{group}`:
-  - Strategy: `LB_STRATEGY` random | round-robin.
+  - Strategy: `LB_STRATEGY` random | round-robin | weighted (latency-based) | weighted-rr (latency-weighted round-robin).
+  - Per-group override via `checks.<group>.lb.type`.
   - Cache-first with fixed 5s max age.
   - Uses `:up` fast path; falls back to full hash or config on errors.
+  - Response is flattened; override fields come from `lb.response_targets`.
 - `/v1/leader`, `/metrics`, `/health` provided for ops/visibility.
 
 ## Metrics (Prometheus)
@@ -127,7 +139,3 @@ Defaults:
 - Optional config reload on SIGHUP.
 - API authn/authz.
 - Persisted Raft logs/snapshots (env `RAFT_DATA_DIR`).
-
-## Open Questions
-- Should followers serve stale data beyond TTL with `stale=true`?
-- Should `/v1/check` return config fallback payloads during Redis outages?

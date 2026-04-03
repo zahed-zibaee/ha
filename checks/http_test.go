@@ -34,6 +34,18 @@ func (s *stubRedis) SRem(ctx context.Context, key string, members ...interface{}
 	return cmd
 }
 
+func (s *stubRedis) ZAdd(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(int64(len(members)))
+	return cmd
+}
+
+func (s *stubRedis) ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(int64(len(members)))
+	return cmd
+}
+
 type assertErr string
 
 func (e assertErr) Error() string { return string(e) }

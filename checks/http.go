@@ -69,8 +69,8 @@ type probeResult struct {
 type RedisSet interface {
 	HSet(ctx context.Context, key string, values ...interface{}) *redis.IntCmd
 	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
-	SAdd(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
-	SRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
+	ZAdd(ctx context.Context, key string, members ...redis.Z) *redis.IntCmd
+	ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
 }
 
 func runHTTPProbe(parent context.Context, target config.Target) probeResult {
@@ -194,9 +194,13 @@ func writeResult(ctx context.Context, rdb RedisSet, group, name string, res prob
 			continue
 		}
 		if res.Reachable {
-			_ = rdb.SAdd(ctx, upKey, name).Err()
+			score := float64(res.LatencyMs)
+			if score <= 0 {
+				score = 1
+			}
+			_ = rdb.ZAdd(ctx, upKey, redis.Z{Score: score, Member: name}).Err()
 		} else {
-			_ = rdb.SRem(ctx, upKey, name).Err()
+			_ = rdb.ZRem(ctx, upKey, name).Err()
 		}
 		if err := rdb.Expire(ctx, hashKey, ttl).Err(); err != nil {
 			slog.Debug("redis expire failed", "group", group, "target", name, "err", err, "attempt", attempt)

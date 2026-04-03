@@ -11,35 +11,47 @@ checks:
     timeout: 2s
     redisTTL: 15s
     retry: 1
-    startTogether: true
     targets:
-      - name: public-health
-        url: https://example.com/health
-        response: 200,204
+      - name: full-http-example1
+        url: https://example1.com/health
+        method: GET
         headers:
           User-Agent: ha-health
-
-      - name: basic-auth-health
-        url: https://example.com/private/health
-        method: GET
+          X-Env: example
         auth_basic_user: user
         auth_basic_pass: pass
-        response: 200
-
-      - name: bearer-health
-        url: https://example.com/api/health
-        method: GET
         auth_bearer: token
-        response: 200
-
-      - name: no-redirect
-        url: https://example.com/redirect
-        follow_redirects: false
-        response: 302
-
-      - name: limited-redirects
-        url: https://example.com/multi-redirect
+        follow_redirects: true
         max_redirects: 2
-        response: 200
+        response: 200,204
+      - name: full-http-example2
+        url: https://example2.com/health
+        method: GET
+        headers:
+          User-Agent: ha-health
+          X-Env: example
+        auth_basic_user: user
+        auth_basic_pass: pass
+        auth_bearer: token
+        follow_redirects: true
+        max_redirects: 2
+        response: 200,204
+    lb:
+      type: round-robin # round-robin | random | weighted (latency-based) | weighted-rr
+      response_targets:
+        # Customize /v1/lb response per target. The response is flattened.
+        # Response always includes group, reachable, name, and error (if any).
+        # If response map is present, it replaces target data fields.
+        - name: full-http-example1
+          response:
+            url: https://example.com/home-page
+            bucket: my-bucket
+            description: "Example override for target 1"
+        - name: full-http-example2
+          response:
+            url: https://example.com/my-page
+            bucket: my-bucket
+            description: "Example override for target 2"
+        
 
 # Planned (not implemented yet): bucket/object/tcp/dns/ping/tls/grpc checks.

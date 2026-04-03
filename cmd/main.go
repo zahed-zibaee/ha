@@ -79,7 +79,9 @@ func main() {
 	go func() {
 		listen := getenvDefault("LISTEN_ADDR", ":8080")
 		lbStrategy := getenvDefault("LB_STRATEGY", "random")
-		if err := api.Start(ctx, listen, rawRedis, lbStrategy, targetIndex, leaderTracker.snapshot, joinFn); err != nil {
+		lbResponses := buildLBResponseIndex(cfg)
+		lbTypes := buildLBTypeIndex(cfg)
+		if err := api.Start(ctx, listen, rawRedis, lbStrategy, targetIndex, lbResponses, lbTypes, leaderTracker.snapshot, joinFn); err != nil {
 			slog.Error("http server exited", "err", err)
 			cancelAndExit(stop)
 		}
@@ -185,6 +187,43 @@ func buildTargetIndex(cfg *config.Config) (map[string]map[string]config.Target, 
 		}
 	}
 	return index, dupes
+}
+
+func buildLBResponseIndex(cfg *config.Config) map[string]map[string]map[string]any {
+	index := make(map[string]map[string]map[string]any)
+	for group, chk := range cfg.Checks {
+		if len(chk.LB.ResponseTargets) == 0 {
+			continue
+		}
+		if index[group] == nil {
+			index[group] = make(map[string]map[string]any)
+		}
+		for _, rt := range chk.LB.ResponseTargets {
+			if rt.Response == nil {
+				continue
+			}
+			resp := make(map[string]any, len(rt.Response)+1)
+			for k, v := range rt.Response {
+				resp[k] = v
+			}
+			if _, ok := resp["name"]; !ok {
+				resp["name"] = rt.Name
+			}
+			index[group][rt.Name] = resp
+		}
+	}
+	return index
+}
+
+func buildLBTypeIndex(cfg *config.Config) map[string]string {
+	index := make(map[string]string)
+	for group, chk := range cfg.Checks {
+		if chk.LB.Type == "" {
+			continue
+		}
+		index[group] = chk.LB.Type
+	}
+	return index
 }
 
 func cancelAndExit(stop context.CancelFunc) {

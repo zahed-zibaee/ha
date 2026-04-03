@@ -606,11 +606,11 @@ probe_endpoints() {
 				api_notes+=("lb status ${code:-unknown} on ${port}")
 				record_failure "lb status ${code:-unknown} on ${port} group=${group} (${label})"
 			fi
-			if ! echo "$out" | rg -q '"target"' && [[ "$ignored" -eq 0 ]]; then
-				echo "lb warning: missing target on ${port}" | tee -a "$report"
+			if ! echo "$out" | rg -q '"name"' && [[ "$ignored" -eq 0 ]]; then
+				echo "lb warning: missing name on ${port}" | tee -a "$report"
 				api_ok=0
-				api_notes+=("lb missing target on ${port}")
-				record_failure "lb missing target on ${port} group=${group} (${label})"
+				api_notes+=("lb missing name on ${port}")
+				record_failure "lb missing name on ${port} group=${group} (${label})"
 			fi
 		done
 		for port in 8080 8081 8082; do

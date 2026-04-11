@@ -5,29 +5,74 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
-	"ha/config"
-	"log/slog"
-	"sync"
-
 	"github.com/redis/go-redis/v9"
+	"ha/config"
 )
 
-// StartHTTPGroup launches one goroutine per HTTP target. Each goroutine stops when ctx is canceled.
-func StartHTTPGroup(ctx context.Context, group string, targets []config.Target, rdb RedisSet) {
+// StartHTTPGroup launches one goroutine per HTTP target and returns a
+// WaitGroup that callers can use to wait for in-flight probes to finish
+// after ctx is canceled.
+func StartHTTPGroup(ctx context.Context, group string, targets []config.Target, rdb RedisSet) *sync.WaitGroup {
+	var wg sync.WaitGroup
 	tracker := newGroupTracker(group, targets)
 	for _, t := range targets {
-		// Copy loop variable
 		target := t
-		go runHTTPLoop(ctx, group, target, rdb, tracker)
+		client := buildHTTPClient(target)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runHTTPLoop(ctx, group, target, rdb, tracker, client)
+		}()
 	}
+	return &wg
 }
 
-func runHTTPLoop(ctx context.Context, group string, target config.Target, rdb RedisSet, tracker *groupTracker) {
+func buildHTTPClient(target config.Target) *http.Client {
+	followRedirects := true
+	if target.FollowRedirects != nil {
+		followRedirects = *target.FollowRedirects
+	}
+	maxRedirects := target.MaxRedirects
+	if maxRedirects <= 0 {
+		maxRedirects = 10
+	}
+
+	transport := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: target.Timeout}).DialContext,
+		TLSHandshakeTimeout: target.Timeout,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     2 * target.Interval,
+	}
+
+	client := &http.Client{Transport: transport}
+	if !followRedirects {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	} else if maxRedirects > 0 {
+		limit := maxRedirects
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= limit {
+				return fmt.Errorf("stopped after %d redirects", limit)
+			}
+			if len(via) > 0 {
+				req.Header = via[0].Header.Clone()
+			}
+			return nil
+		}
+	}
+	return client
+}
+
+func runHTTPLoop(ctx context.Context, group string, target config.Target, rdb RedisSet, tracker *groupTracker, client *http.Client) {
 	jitter := jitterDuration(target.Interval, target.JitterPct)
 	timer := time.NewTimer(jitter)
 	defer timer.Stop()
@@ -38,7 +83,7 @@ func runHTTPLoop(ctx context.Context, group string, target config.Target, rdb Re
 		case <-timer.C:
 			start := time.Now()
 			slog.Debug("http probe start", "group", group, "target", target.Name, "url", target.URL)
-			result := runHTTPProbe(ctx, target)
+			result := runHTTPProbe(ctx, target, client)
 			slog.Debug("http probe result", "group", group, "target", target.Name, "reachable", result.Reachable, "status", result.Status, "latency_ms", result.LatencyMs, "err", result.Error)
 			recordProbe("http")
 			writeStart := time.Now()
@@ -49,7 +94,6 @@ func runHTTPLoop(ctx context.Context, group string, target config.Target, rdb Re
 				slog.Debug("http probe", "group", group, "target", target.Name, "reachable", result.Reachable, "status", result.Status, "latency_ms", result.LatencyMs, "write_ms", time.Since(writeStart).Milliseconds(), "loop_ms", time.Since(start).Milliseconds())
 			}
 			tracker.update(target.Name, result)
-			// next tick with jitter
 			timer.Reset(target.Interval + jitterDuration(target.Interval, target.JitterPct))
 		}
 	}
@@ -62,7 +106,7 @@ type probeResult struct {
 	LatencyMs int64  `json:"latency_ms"`
 	Error     string `json:"error,omitempty"`
 	Type      string `json:"type"`
-	Target    string `json:"target"` // target name (field)
+	Target    string `json:"target"`
 }
 
 // RedisSet defines the subset of redis methods needed for writing results.
@@ -73,9 +117,9 @@ type RedisSet interface {
 	ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd
 }
 
-func runHTTPProbe(parent context.Context, target config.Target) probeResult {
+func runHTTPProbe(parent context.Context, target config.Target, client *http.Client) probeResult {
 	start := time.Now()
-	err := tryHTTP(parent, target)
+	err := tryHTTP(parent, target, client)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		return probeResult{
@@ -98,21 +142,13 @@ func runHTTPProbe(parent context.Context, target config.Target) probeResult {
 	}
 }
 
-func tryHTTP(parent context.Context, target config.Target) error {
+func tryHTTP(parent context.Context, target config.Target, client *http.Client) error {
 	if target.URL == "" {
 		return errors.New("missing url")
 	}
 	method := strings.ToUpper(target.Method)
 	if method == "" {
 		method = http.MethodGet
-	}
-	followRedirects := true
-	if target.FollowRedirects != nil {
-		followRedirects = *target.FollowRedirects
-	}
-	maxRedirects := target.MaxRedirects
-	if maxRedirects <= 0 {
-		maxRedirects = 10
 	}
 	attempts := target.Retry + 1
 	var lastErr error
@@ -130,22 +166,6 @@ func tryHTTP(parent context.Context, target config.Target) error {
 			req.Header.Set("Authorization", "Bearer "+target.AuthBearer)
 		} else if target.AuthBasicUser != "" || target.AuthBasicPass != "" {
 			req.SetBasicAuth(target.AuthBasicUser, target.AuthBasicPass)
-		}
-		client := &http.Client{}
-		if !followRedirects {
-			client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			}
-		} else if maxRedirects > 0 {
-			client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-				if len(via) >= maxRedirects {
-					return fmt.Errorf("stopped after %d redirects", maxRedirects)
-				}
-				if len(via) > 0 {
-					req.Header = via[0].Header.Clone()
-				}
-				return nil
-			}
 		}
 		resp, err := client.Do(req)
 		if err == nil {
@@ -176,47 +196,63 @@ func statusAllowed(code int, allowed []int) bool {
 	return false
 }
 
+// writeResult persists probe data to Redis with retry. Each retry step is
+// independent: HSet, ZAdd/ZRem, and Expire for both keys are attempted
+// separately so a transient Expire failure doesn't re-run HSet.
 func writeResult(ctx context.Context, rdb RedisSet, group, name string, res probeResult, ttl time.Duration) error {
-	hashKey := fmt.Sprintf("hc:%s", group)
-	upKey := fmt.Sprintf("hc:%s:up", group)
+	hashKey := "hc:" + group
+	upKey := "hc:" + group + ":up"
 	b, err := json.Marshal(res)
 	if err != nil {
 		return err
 	}
-	// small jitter to coalesce writes
 	time.Sleep(time.Duration(rand.Intn(30)) * time.Millisecond)
+
+	if err := retryOp(ctx, 3, func() error {
+		return rdb.HSet(ctx, hashKey, name, b).Err()
+	}); err != nil {
+		return fmt.Errorf("hset %s/%s: %w", group, name, err)
+	}
+
+	if res.Reachable {
+		score := float64(res.LatencyMs)
+		if score <= 0 {
+			score = 1
+		}
+		_ = rdb.ZAdd(ctx, upKey, redis.Z{Score: score, Member: name}).Err()
+	} else {
+		_ = rdb.ZRem(ctx, upKey, name).Err()
+	}
+
+	if err := retryOp(ctx, 3, func() error {
+		return rdb.Expire(ctx, hashKey, ttl).Err()
+	}); err != nil {
+		slog.Debug("redis expire failed", "group", group, "target", name, "err", err)
+	}
+	if err := retryOp(ctx, 3, func() error {
+		return rdb.Expire(ctx, upKey, ttl).Err()
+	}); err != nil {
+		slog.Debug("redis expire failed (up set)", "group", group, "target", name, "err", err)
+	}
+	return nil
+}
+
+func retryOp(ctx context.Context, maxAttempts int, op func() error) error {
 	backoff := 50 * time.Millisecond
-	for attempt := 0; attempt < 3; attempt++ {
-		if err := rdb.HSet(ctx, hashKey, name, b).Err(); err != nil {
-			slog.Debug("redis hset failed", "group", group, "target", name, "err", err, "attempt", attempt)
-			time.Sleep(backoff)
-			backoff *= 2
-			continue
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		if res.Reachable {
-			score := float64(res.LatencyMs)
-			if score <= 0 {
-				score = 1
-			}
-			_ = rdb.ZAdd(ctx, upKey, redis.Z{Score: score, Member: name}).Err()
-		} else {
-			_ = rdb.ZRem(ctx, upKey, name).Err()
-		}
-		if err := rdb.Expire(ctx, hashKey, ttl).Err(); err != nil {
-			slog.Debug("redis expire failed", "group", group, "target", name, "err", err, "attempt", attempt)
-			time.Sleep(backoff)
-			backoff *= 2
-			continue
-		}
-		if err := rdb.Expire(ctx, upKey, ttl).Err(); err != nil {
-			slog.Debug("redis expire failed (up set)", "group", group, "target", name, "err", err, "attempt", attempt)
+		if err := op(); err != nil {
+			lastErr = err
 			time.Sleep(backoff)
 			backoff *= 2
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("redis write failed after retries")
+	return lastErr
 }
 
 func jitterDuration(interval time.Duration, pct int) time.Duration {

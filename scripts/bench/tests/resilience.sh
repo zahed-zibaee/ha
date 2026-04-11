@@ -11,14 +11,14 @@ run_resilience() {
 	bench_prepare
 
 	if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
-		echo "waiting for single leader..." | tee -a "$report"
+		echo "waiting for Redis lock leader (or degraded probes if Redis down)..." | tee -a "$report"
 		if ! wait_for_leader; then
 			echo "leader did not converge in time" | tee -a "$report"
 			record_failure "leader did not converge: before"
 			emit_leader_logs "before"
-			add_check "raft" "leader converge before" "fail"
+			add_check "leader" "leader converge before" "fail"
 		else
-			add_check "raft" "leader converge before" "pass"
+			add_check "leader" "leader converge before" "pass"
 		fi
 	fi
 
@@ -47,17 +47,17 @@ run_resilience() {
 	local stopped=""
 	if [[ "$STOP_TARGET" != "none" ]]; then
 		if [[ "$STOP_TARGET" == "leader" ]]; then
-			stopped="${leader_before:-ha1}"
+			stopped="${leader_before:-${REPLICA_CONTAINERS[0]}}"
+		elif [[ "$STOP_TARGET" =~ ^[0-9]+$ ]]; then
+			local idx=$(( STOP_TARGET - 1 ))
+			stopped="${REPLICA_CONTAINERS[$idx]:-${REPLICA_CONTAINERS[0]}}"
 		else
 			stopped="$STOP_TARGET"
 		fi
 		echo "" | tee -a "$report"
 		probe_metrics "before stop"
 		echo "stopping ${stopped}" | tee -a "$report"
-		if [[ -n "$stopped" ]]; then
-			ignore_port "$(port_from_svc "$stopped")"
-		fi
-		compose stop "$stopped" | tee -a "$report"
+		stop_replica "$stopped"
 		add_check "steps" "stop ${stopped}" "pass"
 		sleep 2
 	fi
@@ -68,9 +68,9 @@ run_resilience() {
 			echo "leader did not converge after stop" | tee -a "$report"
 			record_failure "leader did not converge: after stop"
 			emit_leader_logs "after stop"
-			add_check "raft" "leader converge after stop" "fail"
+			add_check "leader" "leader converge after stop" "fail"
 		else
-			add_check "raft" "leader converge after stop" "pass"
+			add_check "leader" "leader converge after stop" "pass"
 		fi
 	fi
 
@@ -81,11 +81,7 @@ run_resilience() {
 		echo "leader after (logs): ${leader_after:-unknown}" | tee -a "$report"
 	fi
 
-	local base_port
-	base_port="$(port_from_url "$BASE_URL")"
-	local base_svc
-	base_svc="$(svc_from_port "$base_port")"
-	if [[ -n "$stopped" && "$base_svc" == "$stopped" ]]; then
+	if [[ -n "$stopped" && "$stopped" == "$(echo "$BASE_URL" | sed -n 's#http://\([^:]*\).*#\1#p')" ]]; then
 		local new_base
 		new_base="$(pick_live_base_url "$leader_after")"
 		if [[ "$new_base" != "$BASE_URL" ]]; then
@@ -109,9 +105,8 @@ run_resilience() {
 	if [[ -n "$stopped" && "$RESTART_STOPPED" == "true" ]]; then
 		echo "" | tee -a "$report"
 		echo "restarting ${stopped}" | tee -a "$report"
-		compose start "$stopped" | tee -a "$report"
+		start_replica "$stopped"
 		rejoined="$stopped"
-		unignore_port "$(port_from_svc "$stopped")"
 		add_check "steps" "restart ${stopped}" "pass"
 	fi
 
@@ -122,18 +117,18 @@ run_resilience() {
 				echo "leader did not converge after restart" | tee -a "$report"
 				record_failure "leader did not converge: after restart"
 				emit_leader_logs "after restart"
-				add_check "raft" "leader converge after restart" "fail"
+				add_check "leader" "leader converge after restart" "fail"
 			else
-				add_check "raft" "leader converge after restart" "pass"
+				add_check "leader" "leader converge after restart" "pass"
 			fi
 		fi
 		probe_leaders "after restart"
 		if [[ -n "$leader_detected" ]]; then
 			echo "rejoin: leader=${leader_detected} restarted=${rejoined}" | tee -a "$report"
-			add_check "raft" "rejoin after restart" "pass" "leader=${leader_detected} restarted=${rejoined}"
+			add_check "leader" "rejoin after restart" "pass" "leader=${leader_detected} restarted=${rejoined}"
 		else
 			record_failure "rejoin failed after restart"
-			add_check "raft" "rejoin after restart" "fail"
+			add_check "leader" "rejoin after restart" "fail"
 		fi
 	fi
 
@@ -146,8 +141,7 @@ run_resilience() {
 			echo "" | tee -a "$report"
 			probe_metrics "before rotation stop"
 			echo "rotation: stopping leader ${local_leader}" | tee -a "$report"
-			ignore_port "$(port_from_svc "$local_leader")"
-			compose stop "$local_leader" | tee -a "$report"
+			stop_replica "$local_leader"
 			add_check "steps" "stop ${local_leader} (rotation)" "pass"
 			sleep 2
 			if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
@@ -156,27 +150,25 @@ run_resilience() {
 					echo "leader did not converge after rotation" | tee -a "$report"
 					record_failure "leader did not converge: after rotation"
 					emit_leader_logs "after rotation"
-					add_check "raft" "leader converge after rotation" "fail"
+					add_check "leader" "leader converge after rotation" "fail"
 				else
-					add_check "raft" "leader converge after rotation" "pass"
+					add_check "leader" "leader converge after rotation" "pass"
 				fi
 			fi
 			probe_leaders "after rotation"
 			if [[ -n "$leader_detected" ]]; then
 				if [[ "$leader_detected" == "$rejoined" ]]; then
 					echo "rotation: restarted node elected leader" | tee -a "$report"
-					add_check "raft" "leader rotation" "pass" "leader=${leader_detected} restarted=${rejoined}"
 				else
 					echo "rotation: leader=${leader_detected} restarted=${rejoined}" | tee -a "$report"
-					add_check "raft" "leader rotation" "pass" "leader=${leader_detected} restarted=${rejoined}"
 				fi
+				add_check "leader" "leader rotation" "pass" "leader=${leader_detected} restarted=${rejoined}"
 			else
 				record_failure "leader rotation failed"
-				add_check "raft" "leader rotation" "fail"
+				add_check "leader" "leader rotation" "fail"
 			fi
 			echo "rotation: restarting ${local_leader}" | tee -a "$report"
-			compose start "$local_leader" | tee -a "$report"
-			unignore_port "$(port_from_svc "$local_leader")"
+			start_replica "$local_leader"
 			add_check "steps" "restart ${local_leader} (rotation)" "pass"
 		fi
 	fi

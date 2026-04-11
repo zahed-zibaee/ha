@@ -11,25 +11,24 @@ bench_parse_args "$@"
 bench_prepare
 
 if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
-	echo "waiting for single leader..." | tee -a "$report"
+	echo "waiting for Redis lock leader (or degraded probes if Redis down)..." | tee -a "$report"
 	if ! wait_for_leader; then
 		echo "leader did not converge in time" | tee -a "$report"
 		record_failure "leader did not converge: consistency"
 		emit_leader_logs "consistency"
-		add_check "raft" "leader converge" "fail"
+		add_check "leader" "leader converge" "fail"
 	else
-		add_check "raft" "leader converge" "pass"
+		add_check "leader" "leader converge" "pass"
 	fi
 fi
 
 probe_leaders "consistency"
-leader_svc="${leader_detected:-}"
-leader_port="$(port_from_svc "$leader_svc")"
+leader_name="${leader_detected:-}"
 
 metrics_probe_value() {
-	local port="$1"
+	local url="$1"
 	local body
-	body="$(curl -sS --max-time 2 "http://localhost:${port}/metrics" || true)"
+	body="$(curl -sS --max-time 2 "${url}/metrics" || true)"
 	if [[ -z "$body" ]]; then
 		echo "0"
 		return
@@ -37,30 +36,44 @@ metrics_probe_value() {
 	metrics_sum "$body" "probe_runs_total"
 }
 
-base_8080="$(metrics_probe_value 8080)"
-base_8081="$(metrics_probe_value 8081)"
-base_8082="$(metrics_probe_value 8082)"
+declare -A base_values
+for i in "${!REPLICA_URLS[@]}"; do
+	local_url="${REPLICA_URLS[$i]}"
+	local_name="${REPLICA_CONTAINERS[$i]}"
+	base_values["$local_name"]="$(metrics_probe_value "$local_url")"
+done
 
 sleep "$CONSISTENCY_WINDOW"
 
-after_8080="$(metrics_probe_value 8080)"
-after_8081="$(metrics_probe_value 8081)"
-after_8082="$(metrics_probe_value 8082)"
+declare -A after_values
+for i in "${!REPLICA_URLS[@]}"; do
+	local_url="${REPLICA_URLS[$i]}"
+	local_name="${REPLICA_CONTAINERS[$i]}"
+	after_values["$local_name"]="$(metrics_probe_value "$local_url")"
+done
 
-delta_8080=$(awk -v a="$after_8080" -v b="$base_8080" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.0f", d}')
-delta_8081=$(awk -v a="$after_8081" -v b="$base_8081" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.0f", d}')
-delta_8082=$(awk -v a="$after_8082" -v b="$base_8082" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.0f", d}')
+active_replicas=()
+for i in "${!REPLICA_CONTAINERS[@]}"; do
+	local_name="${REPLICA_CONTAINERS[$i]}"
+	delta=$(awk -v a="${after_values[$local_name]}" -v b="${base_values[$local_name]}" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.0f", d}')
+	echo "probe delta ${local_name}: ${delta}" | tee -a "$report"
+	if [[ "$delta" -gt 0 ]]; then
+		active_replicas+=("$local_name")
+	fi
+done
 
-active_ports=()
-if [[ "$delta_8080" -gt 0 ]]; then active_ports+=(8080); fi
-if [[ "$delta_8081" -gt 0 ]]; then active_ports+=(8081); fi
-if [[ "$delta_8082" -gt 0 ]]; then active_ports+=(8082); fi
+redis_err="$(bench_redis_check_error)"
+n_active="${#active_replicas[@]}"
+n_replicas="${#REPLICA_CONTAINERS[@]}"
 
-if [[ "${#active_ports[@]}" -eq 1 && -n "$leader_port" && "${active_ports[0]}" == "$leader_port" ]]; then
-	add_check "raft" "leader-only probes" "pass" "leader=${leader_svc}"
+if [[ "$redis_err" -eq 1 && "$n_active" -eq "$n_replicas" && "$n_replicas" -gt 0 ]]; then
+	echo "consistency: Redis check error; expecting all ${n_replicas} replicas to run probes" | tee -a "$report"
+	add_check "leader" "probe placement (redis down)" "pass" "all_replicas=${n_active}"
+elif [[ "${#active_replicas[@]}" -eq 1 && -n "$leader_name" && "${active_replicas[0]}" == "$leader_name" ]]; then
+	add_check "leader" "single-lock probes" "pass" "leader=${leader_name}"
 else
-	record_failure "leader-only probes mismatch"
-	add_check "raft" "leader-only probes" "fail" "leader=${leader_svc:-unknown} active=$(IFS=','; echo "${active_ports[*]}")"
+	record_failure "probe placement mismatch"
+	add_check "leader" "single-lock probes" "fail" "leader=${leader_name:-unknown} active=$(IFS=','; echo "${active_replicas[*]}") redis_err=${redis_err}"
 fi
 
 probe_metrics "consistency"

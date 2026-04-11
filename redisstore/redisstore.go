@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"ha/envutil"
 )
 
 // Options collects Redis connection settings.
@@ -23,7 +24,7 @@ func FromEnv() Options {
 		fmt.Sscanf(v, "%d", &db)
 	}
 	return Options{
-		Addr:     getenvDefault("REDIS_ADDR", "127.0.0.1:6379"),
+		Addr:     envutil.GetDefault("REDIS_ADDR", "127.0.0.1:6379"),
 		Password: os.Getenv("REDIS_PASSWORD"),
 		DB:       db,
 	}
@@ -50,11 +51,4 @@ func Ping(ctx context.Context, c *redis.Client) error {
 	defer cancel()
 	_, err := c.Ping(ctx).Result()
 	return err
-}
-
-func getenvDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }

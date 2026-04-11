@@ -1,10 +1,18 @@
 # Common helpers for benchmark scripts.
+# Works with deploy.replicas-based ha service (Docker Compose v2).
 
 bench_defaults() {
+	if [[ -z "${ROOT_DIR:-}" ]]; then
+		echo "scripts/bench/lib/common.sh: set ROOT_DIR before bench_defaults" >&2
+		exit 1
+	fi
+	# Single bench stack: mock-target + isolated Redis (no host 6379) + ha replicas.
+	export COMPOSE_FILE="${COMPOSE_FILE:-scripts/bench/docker-compose.test.yml}"
+	export BENCH_CONFIG="${BENCH_CONFIG:-$ROOT_DIR/scripts/bench/config-targets.test.yaml}"
 	: "${GROUP:=web-health}"
 	: "${GROUPS_OVERRIDE:=}"
 	: "${AUTO_GROUPS:=true}"
-	: "${BASE_URL:=http://localhost:8081}"
+	: "${BASE_URL:=}"
 	: "${CONCURRENCY:=50}"
 	: "${DURATION:=30s}"
 	: "${STOP_TARGET:=leader}"
@@ -26,6 +34,11 @@ bench_defaults() {
 	: "${REPORT_FILE:=}"
 	: "${PRINT_SUMMARY:=true}"
 	: "${PRINT_RAW_REPORT:=true}"
+	: "${HA_INTERNAL_PORT:=8080}"
+	# auto: try published host port (curl from your machine) then bridge IP. host|bridge: force one mode.
+	: "${BENCH_REPLICA_URL_MODE:=auto}"
+	: "${BENCH_DOCKER_PUBLISH_BIND:=127.0.0.1}"
+	: "${BENCH_WAIT_URL_TRIES:=45}"
 }
 
 bench_now_ts() {
@@ -44,20 +57,23 @@ bench_usage() {
 	cat <<EOF
 Usage: $0 [options]
 
+Defaults (override via env): COMPOSE_FILE=scripts/bench/docker-compose.test.yml,
+BENCH_CONFIG=<repo>/scripts/bench/config-targets.test.yaml
+
 Options:
   --group NAME           Check group (default: ${GROUP})
   --groups LIST          Comma-separated group list (default: auto from config)
   --no-auto-groups       Do not auto-detect groups from config
-  --base-url URL         Base URL for siege (default: ${BASE_URL})
+  --base-url URL         Base URL for siege (default: auto-discovered)
   --concurrency N        Siege concurrency (default: ${CONCURRENCY})
   --duration DUR         Siege duration (default: ${DURATION})
-  --stop TARGET          leader|ha1|ha2|ha3|none (default: ${STOP_TARGET})
+  --stop TARGET          leader|1|2|3|none (default: ${STOP_TARGET})
   --no-build             Skip docker build on up
   --no-restart           Do not restart stopped node
   --out-dir DIR          Report directory (default: ${OUT_DIR})
   --no-wait-checks       Skip waiting for non-empty check results
   --wait-timeout SECS    Wait timeout for checks (default: ${WAIT_CHECKS_TIMEOUT})
-  --no-wait-leader       Skip waiting for a single leader
+  --no-wait-leader       Skip waiting for lock leader (or degraded quorum)
   --leader-timeout SECS  Wait timeout for leader (default: ${WAIT_LEADER_TIMEOUT})
   --no-stabilize         Skip stability wait on start (default: ${STABILIZE_ON_START})
   --no-metrics           Skip /metrics probe
@@ -116,7 +132,7 @@ bench_init_state() {
 	FAILURES=()
 	CHECKS=()
 	METRICS_SAMPLES=()
-	IGNORE_PORTS=()
+	STOPPED_REPLICAS=()
 	declare -gA METRICS_LAST
 	declare -gA METRICS_LAST_TS
 	declare -gA LEADER_LOGGED
@@ -126,6 +142,9 @@ bench_init_state() {
 	leader_detected=""
 	leader_count=0
 	leader_states=()
+	REPLICA_CONTAINERS=()
+	REPLICA_IPS=()
+	REPLICA_URLS=()
 }
 
 record_failure() {
@@ -148,6 +167,146 @@ add_check() {
 	fi
 }
 
+# --- Replica discovery ---
+
+# replica_url_for_container picks a URL the bench host can use. Bridge IPs often time out from
+# WSL2 / Docker Desktop hosts; published ports (127.0.0.1:<mapped>) usually work.
+replica_url_for_container() {
+	local cid="$1"
+	local ip
+	ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$cid" 2>/dev/null)"
+	local bridge_url=""
+	if [[ -n "$ip" ]]; then
+		bridge_url="http://${ip}:${HA_INTERNAL_PORT}"
+	fi
+	local port_line host_url=""
+	port_line="$(docker port "$cid" "${HA_INTERNAL_PORT}/tcp" 2>/dev/null | head -n1 || true)"
+	if [[ -n "$port_line" ]] && [[ "$port_line" =~ :([0-9]+)$ ]]; then
+		host_url="http://${BENCH_DOCKER_PUBLISH_BIND}:${BASH_REMATCH[1]}"
+	fi
+	local mode="${BENCH_REPLICA_URL_MODE:-auto}"
+	case "$mode" in
+		bridge)
+			echo "$bridge_url"
+			return
+			;;
+		host)
+			echo "${host_url:-$bridge_url}"
+			return
+			;;
+		auto|*)
+			if [[ -n "$host_url" ]] && curl -fsS --max-time 2 "${host_url}/health" >/dev/null 2>&1; then
+				echo "$host_url"
+				return
+			fi
+			if [[ -n "$bridge_url" ]] && curl -fsS --max-time 2 "${bridge_url}/health" >/dev/null 2>&1; then
+				echo "$bridge_url"
+				return
+			fi
+			if [[ -n "$host_url" ]]; then
+				echo "$host_url"
+				return
+			fi
+			echo "$bridge_url"
+			return
+			;;
+	esac
+}
+
+discover_replicas() {
+	REPLICA_CONTAINERS=()
+	REPLICA_IPS=()
+	REPLICA_URLS=()
+	local ids
+	ids="$(compose ps -q ha 2>/dev/null)"
+	if [[ -z "$ids" ]]; then
+		echo "no ha replicas found" >&2
+		return 1
+	fi
+	while IFS= read -r cid; do
+		[[ -z "$cid" ]] && continue
+		local name ip url
+		name="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')"
+		ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$cid" 2>/dev/null)"
+		url="$(replica_url_for_container "$cid")"
+		if [[ -n "$name" && -n "$url" ]]; then
+			REPLICA_CONTAINERS+=("$name")
+			REPLICA_IPS+=("$ip")
+			REPLICA_URLS+=("$url")
+		fi
+	done <<< "$ids"
+	echo "discovered ${#REPLICA_CONTAINERS[@]} replicas: ${REPLICA_CONTAINERS[*]}" | tee -a "${report:-/dev/null}" 2>/dev/null || true
+	local u
+	for u in "${REPLICA_URLS[@]}"; do
+		echo "replica_url ${u}" | tee -a "${report:-/dev/null}" 2>/dev/null || true
+	done
+}
+
+replica_url() {
+	local idx="$1"
+	echo "${REPLICA_URLS[$idx]:-}"
+}
+
+replica_name() {
+	local idx="$1"
+	echo "${REPLICA_CONTAINERS[$idx]:-}"
+}
+
+replica_count() {
+	echo "${#REPLICA_CONTAINERS[@]}"
+}
+
+is_replica_stopped() {
+	local name="$1"
+	for n in "${STOPPED_REPLICAS[@]}"; do
+		if [[ "$n" == "$name" ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+stop_replica() {
+	local name="$1"
+	docker stop "$name" >/dev/null 2>&1 || true
+	STOPPED_REPLICAS+=("$name")
+}
+
+start_replica() {
+	local name="$1"
+	docker start "$name" >/dev/null 2>&1 || true
+	local next=()
+	for n in "${STOPPED_REPLICAS[@]}"; do
+		if [[ "$n" != "$name" ]]; then
+			next+=("$n")
+		fi
+	done
+	STOPPED_REPLICAS=("${next[@]+"${next[@]}"}")
+}
+
+running_replicas() {
+	local names=()
+	for name in "${REPLICA_CONTAINERS[@]}"; do
+		if ! is_replica_stopped "$name"; then
+			names+=("$name")
+		fi
+	done
+	echo "${names[*]}"
+}
+
+index_of_replica() {
+	local target="$1"
+	for i in "${!REPLICA_CONTAINERS[@]}"; do
+		if [[ "${REPLICA_CONTAINERS[$i]}" == "$target" ]]; then
+			echo "$i"
+			return
+		fi
+	done
+	echo "-1"
+}
+
+# --- Leader & log helpers ---
+
 emit_leader_logs() {
 	local label="$1"
 	if [[ -n "${LEADER_LOGGED[$label]:-}" ]]; then
@@ -156,46 +315,29 @@ emit_leader_logs() {
 	LEADER_LOGGED["$label"]=1
 	echo "" | tee -a "$report"
 	echo "leader logs: ${label}" | tee -a "$report"
-	for svc in ha1 ha2 ha3; do
+	for name in "${REPLICA_CONTAINERS[@]}"; do
 		local logs
-		logs="$(compose logs --no-color --tail 200 "$svc" 2>/dev/null | rg -n "starting checks as current leader|became leader; starting checks|lost leadership; stopping checks" || true)"
+		logs="$(docker logs --tail 200 "$name" 2>/dev/null | rg -n "leadership acquired|starting checks|stopping checks|leader lock lost|leader lock renew failed" || true)"
 		if [[ -n "$logs" ]]; then
-			echo "${svc} logs:" | tee -a "$report"
+			echo "${name} logs:" | tee -a "$report"
 			echo "$logs" | tail -n 5 | tee -a "$report"
 		fi
 	done
 }
 
-ignore_port() {
-	local port="$1"
-	for p in "${IGNORE_PORTS[@]}"; do
-		if [[ "$p" == "$port" ]]; then
+detect_leader() {
+	for i in "${!REPLICA_URLS[@]}"; do
+		local body
+		body="$(curl -sS --max-time 2 "${REPLICA_URLS[$i]}/v1/leader" || true)"
+		if [[ "$(parse_bool "$body")" == "true" ]]; then
+			echo "${REPLICA_CONTAINERS[$i]}"
 			return
 		fi
 	done
-	IGNORE_PORTS+=("$port")
+	echo ""
 }
 
-unignore_port() {
-	local port="$1"
-	local next=()
-	for p in "${IGNORE_PORTS[@]}"; do
-		if [[ "$p" != "$port" ]]; then
-			next+=("$p")
-		fi
-	done
-	IGNORE_PORTS=("${next[@]}")
-}
-
-is_ignored_port() {
-	local port="$1"
-	for p in "${IGNORE_PORTS[@]}"; do
-		if [[ "$p" == "$port" ]]; then
-			return 0
-		fi
-	done
-	return 1
-}
+# --- URL helpers ---
 
 bench_detect_compose() {
 	compose_cmd=()
@@ -216,7 +358,38 @@ compose() {
 bench_require_cmds() {
 	require_cmd curl
 	require_cmd rg
+	require_cmd docker
 }
+
+pick_live_base_url() {
+	local prefer="$1"
+	if [[ -n "$prefer" ]]; then
+		local idx
+		idx="$(index_of_replica "$prefer")"
+		if [[ "$idx" -ge 0 ]]; then
+			local url="${REPLICA_URLS[$idx]}"
+			if curl -fsS --max-time 2 "$url/health" >/dev/null 2>&1; then
+				echo "$url"
+				return
+			fi
+		fi
+	fi
+	for url in "${REPLICA_URLS[@]}"; do
+		if curl -fsS --max-time 2 "$url/health" >/dev/null 2>&1; then
+			echo "$url"
+			return
+		fi
+	done
+	echo "$BASE_URL"
+}
+
+# Re-discover replica URLs and point BASE_URL at a healthy replica (needed after docker stop/start).
+refresh_live_base_url() {
+	discover_replicas 2>/dev/null || true
+	BASE_URL="$(pick_live_base_url "")"
+}
+
+# --- Report / lifecycle ---
 
 bench_init_report() {
 	bench_init_state
@@ -248,9 +421,25 @@ bench_compose_up() {
 	add_check "steps" "compose up" "pass"
 }
 
+bench_discover() {
+	local retries=15
+	for _ in $(seq 1 "$retries"); do
+		discover_replicas && [[ "${#REPLICA_CONTAINERS[@]}" -gt 0 ]] && break
+		sleep 2
+	done
+	if [[ "${#REPLICA_CONTAINERS[@]}" -eq 0 ]]; then
+		echo "FATAL: could not discover any ha replicas" >&2
+		exit 1
+	fi
+	if [[ -z "$BASE_URL" ]]; then
+		BASE_URL="$(pick_live_base_url "")"
+	fi
+	echo "base_url=${BASE_URL} replicas=${#REPLICA_CONTAINERS[@]}" | tee -a "$report"
+}
+
 wait_for_url() {
 	local url="$1"
-	local tries=30
+	local tries="${BENCH_WAIT_URL_TRIES:-45}"
 	for _ in $(seq 1 "$tries"); do
 		if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
 			return 0
@@ -269,7 +458,7 @@ collect_groups() {
 		echo "$GROUP"
 		return
 	fi
-	local cfg="$ROOT_DIR/config-targets.yaml"
+	local cfg="${BENCH_CONFIG:-$ROOT_DIR/scripts/bench/config-targets.test.yaml}"
 	if [[ ! -f "$cfg" ]]; then
 		if [[ -n "$GROUPS_OVERRIDE" ]]; then
 			echo "$GROUPS_OVERRIDE"
@@ -357,114 +546,31 @@ bench_wait_lb() {
 	fi
 }
 
-bench_stabilize() {
-	if [[ "$STABILIZE_ON_START" != "true" ]]; then
-		return
-	fi
-	if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
-		echo "waiting for single leader..." | tee -a "$report"
-		if ! wait_for_leader; then
-			echo "leader did not converge in time" | tee -a "$report"
-			record_failure "leader did not converge on start"
-			emit_leader_logs "startup"
-			add_check "raft" "leader converge (startup)" "fail"
-		else
-			add_check "raft" "leader converge (startup)" "pass"
-		fi
-	fi
-	if [[ "$WAIT_FOR_CHECKS" == "true" ]]; then
-		echo "waiting for non-empty check results..." | tee -a "$report"
-		if ! wait_for_checks; then
-			echo "checks did not become ready in time" | tee -a "$report"
-			record_failure "checks did not become ready on start"
-			add_check "api" "checks ready (startup)" "fail"
-		else
-			add_check "api" "checks ready (startup)" "pass"
-		fi
-	fi
-}
-
-bench_prepare() {
-	bench_detect_compose
-	bench_init_report
-	bench_require_cmds
-	bench_compose_up
-	bench_collect_groups
-	bench_wait_lb
-	bench_stabilize
-}
-
-port_from_url() {
-	echo "$1" | sed -n 's#^[a-zA-Z]*://[^:/]*:\([0-9]*\).*#\1#p'
-}
-
-svc_from_port() {
-	case "$1" in
-		8080) echo "ha1" ;;
-		8081) echo "ha2" ;;
-		8082) echo "ha3" ;;
-	esac
-}
-
-port_from_svc() {
-	case "$1" in
-		ha1) echo "8080" ;;
-		ha2) echo "8081" ;;
-		ha3) echo "8082" ;;
-	esac
-}
-
-pick_live_base_url() {
-	local leader_svc="$1"
-	local leader_port
-	if [[ -n "$leader_svc" ]]; then
-		leader_port="$(port_from_svc "$leader_svc")"
-		if [[ -n "$leader_port" ]]; then
-			local url="http://localhost:${leader_port}"
-			if curl -fsS --max-time 2 "$url/health" >/dev/null 2>&1; then
-				echo "$url"
-				return
-			fi
-		fi
-	fi
-	for port in 8080 8081 8082; do
-		local url="http://localhost:${port}"
-		if curl -fsS --max-time 2 "$url/health" >/dev/null 2>&1; then
-			echo "$url"
-			return
-		fi
-	done
-	echo "$BASE_URL"
-}
-
-# Log-based fallback leader detection.
-detect_leader() {
-	local leader=""
-	for svc in ha1 ha2 ha3; do
-		local logs
-		logs="$(compose logs --no-color --tail 200 "$svc" 2>/dev/null | rg -n "starting checks as current leader|became leader; starting checks|lost leadership; stopping checks" || true)"
-		if [[ -z "$logs" ]]; then
-			continue
-		fi
-		local last
-		last="$(echo "$logs" | tail -n1)"
-		if echo "$last" | rg -q "starting checks as current leader|became leader; starting checks"; then
-			leader="$svc"
-		fi
-	done
-	echo "$leader"
-}
+# --- JSON helpers ---
 
 parse_bool() {
 	echo "$1" | rg -o '"leader":(true|false)' | rg -o 'true|false' || true
 }
 
-parse_status() {
-	echo "$1" | rg -o '"status":"[^"]+"' | sed 's/"status":"//;s/"$//' || true
+parse_probes_active() {
+	echo "$1" | rg -o '"probes_active":(true|false)' | rg -o 'true|false' || true
 }
 
-parse_state() {
-	echo "$1" | rg -o '"raft_state":"[^"]+"' | sed 's/"raft_state":"//;s/"$//' || true
+# Returns 1 if BASE_URL /v1/check/GROUP reports redis_status error, else 0.
+bench_redis_check_error() {
+	local body
+	body="$(curl -sS --max-time 2 "${BASE_URL}/v1/check/${GROUP}" 2>/dev/null || true)"
+	local st
+	st="$(parse_redis_status "$body")"
+	if [[ "$st" == "error" ]]; then
+		echo 1
+		return
+	fi
+	echo 0
+}
+
+parse_status() {
+	echo "$1" | rg -o '"status":"[^"]+"' | sed 's/"status":"//;s/"$//' || true
 }
 
 parse_node() {
@@ -487,6 +593,8 @@ count_total() {
 	echo "${total:-0}"
 }
 
+# --- Probing functions ---
+
 leader_detected=""
 leader_count=0
 leader_states=()
@@ -497,12 +605,14 @@ probe_leaders() {
 	leader_states=()
 	echo "" | tee -a "$report"
 	echo "leader probe: $label" | tee -a "$report"
-	local ports=(8080 8081 8082)
-	local svcs=(ha1 ha2 ha3)
-	for i in "${!ports[@]}"; do
-		local port="${ports[$i]}"
-		local svc="${svcs[$i]}"
-		local url="http://localhost:${port}/v1/leader"
+	local all_probes=1
+	for i in "${!REPLICA_URLS[@]}"; do
+		local url="${REPLICA_URLS[$i]}/v1/leader"
+		local name="${REPLICA_CONTAINERS[$i]}"
+		local stopped=0
+		if is_replica_stopped "$name"; then
+			stopped=1
+		fi
 		local body
 		body="$(curl -sS --max-time 2 "$url" || true)"
 		local leader
@@ -511,41 +621,64 @@ probe_leaders() {
 		status="$(parse_status "$body")"
 		local node
 		node="$(parse_node "$body")"
-		local state
-		state="$(parse_state "$body")"
+		local pa
+		pa="$(parse_probes_active "$body")"
 		if [[ "$leader" == "true" ]]; then
-			leader_detected="$svc"
+			leader_detected="$name"
 			leader_count=$((leader_count + 1))
 		fi
-		leader_states+=("${svc}=${leader}:${status}:${node}:${state}")
-		echo "leader ${svc} ${port}: ${body}" | tee -a "$report"
+		if [[ "$stopped" -eq 0 && "$pa" != "true" ]]; then
+			all_probes=0
+		fi
+		leader_states+=("${name}=${leader}:${status}:${node}:probes=${pa}")
+		echo "leader ${name}: ${body}" | tee -a "$report"
 	done
 	echo "leader count=${leader_count} leader=${leader_detected:-unknown}" | tee -a "$report"
-	if [[ "$leader_count" -ne 1 ]]; then
-		echo "leader check warning: expected 1 leader, got ${leader_count}" | tee -a "$report"
+	if [[ "$leader_count" -eq 1 ]]; then
+		add_check "leader" "leader count ${label}" "pass"
+	elif [[ "$leader_count" -eq 0 && "$all_probes" -eq 1 && "${#REPLICA_URLS[@]}" -gt 0 ]]; then
+		echo "leader check: no Redis lock holder; all replicas report probes_active (Redis unreachable mode)" | tee -a "$report"
+		add_check "leader" "leader count ${label}" "pass" "degraded_all_probes"
+	else
+		echo "leader check warning: expected 1 lock leader or all-replica probes, got leaders=${leader_count} all_probes=${all_probes}" | tee -a "$report"
 		record_failure "leader count ${leader_count} at ${label}"
 		emit_leader_logs "$label"
-		add_check "raft" "leader count ${label}" "fail" "count=${leader_count}"
-	else
-		add_check "raft" "leader count ${label}" "pass"
+		add_check "leader" "leader count ${label}" "fail" "count=${leader_count}"
 	fi
 }
 
 wait_for_leader() {
 	local tries="${WAIT_LEADER_TIMEOUT}"
 	for _ in $(seq 1 "$tries"); do
+		discover_replicas 2>/dev/null || true
 		local count=0
-		for port in 8080 8081 8082; do
+		local running=0
+		local probes_ok=0
+		for i in "${!REPLICA_URLS[@]}"; do
+			local url="${REPLICA_URLS[$i]}/v1/leader"
+			local name="${REPLICA_CONTAINERS[$i]}"
+			if is_replica_stopped "$name"; then
+				continue
+			fi
+			running=$((running + 1))
 			local body
-			body="$(curl -sS --max-time 2 "http://localhost:${port}/v1/leader" || true)"
+			body="$(curl -sS --max-time 2 "$url" || true)"
 			local leader
 			leader="$(parse_bool "$body")"
 			if [[ "$leader" == "true" ]]; then
 				count=$((count + 1))
 			fi
-			done
+			if [[ "$(parse_probes_active "$body")" == "true" ]]; then
+				probes_ok=$((probes_ok + 1))
+			fi
+		done
 		if [[ "$count" -eq 1 ]]; then
 			return 0
+		fi
+		if [[ "$count" -eq 0 && "$running" -gt 0 && "$probes_ok" -eq "$running" ]]; then
+			if [[ "$(bench_redis_check_error)" -eq 1 ]]; then
+				return 0
+			fi
 		fi
 		sleep 1
 	done
@@ -568,7 +701,7 @@ wait_for_checks() {
 				ok=0
 				break
 			fi
-			done
+		done
 		if [[ "$ok" -eq 1 ]]; then
 			return 0
 		fi
@@ -589,36 +722,40 @@ probe_endpoints() {
 	echo "endpoint probe: $label" | tee -a "$report"
 	for group in "${GROUP_LIST[@]}"; do
 		echo "group ${group}:" | tee -a "$report"
-		for port in 8080 8081 8082; do
-			local ignored=0
-			if is_ignored_port "$port"; then
-				ignored=1
+		for i in "${!REPLICA_URLS[@]}"; do
+			local base="${REPLICA_URLS[$i]}"
+			local name="${REPLICA_CONTAINERS[$i]}"
+			local stopped=0
+			if is_replica_stopped "$name"; then
+				stopped=1
 			fi
-			local url="http://localhost:${port}/v1/lb/${group}"
+			local url="${base}/v1/lb/${group}"
 			local out
 			out="$(curl -sS --max-time 2 -w " code=%{http_code} time=%{time_total}s" "$url" || true)"
-			echo "lb ${port}: ${out}" | tee -a "$report"
+			echo "lb ${name}: ${out}" | tee -a "$report"
 			local code
 			code="$(echo "$out" | rg -o 'code=[0-9]+' | sed 's/code=//')"
-			if [[ "$code" != "200" && "$ignored" -eq 0 ]]; then
-				echo "lb warning: status ${code:-unknown} on ${port}" | tee -a "$report"
+			if [[ "$code" != "200" && "$stopped" -eq 0 ]]; then
+				echo "lb warning: status ${code:-unknown} on ${name}" | tee -a "$report"
 				api_ok=0
-				api_notes+=("lb status ${code:-unknown} on ${port}")
-				record_failure "lb status ${code:-unknown} on ${port} group=${group} (${label})"
+				api_notes+=("lb status ${code:-unknown} on ${name}")
+				record_failure "lb status ${code:-unknown} on ${name} group=${group} (${label})"
 			fi
-			if ! echo "$out" | rg -q '"name"' && [[ "$ignored" -eq 0 ]]; then
-				echo "lb warning: missing name on ${port}" | tee -a "$report"
+			if ! echo "$out" | rg -q '"name"' && [[ "$stopped" -eq 0 ]]; then
+				echo "lb warning: missing name on ${name}" | tee -a "$report"
 				api_ok=0
-				api_notes+=("lb missing name on ${port}")
-				record_failure "lb missing name on ${port} group=${group} (${label})"
+				api_notes+=("lb missing name on ${name}")
+				record_failure "lb missing name on ${name} group=${group} (${label})"
 			fi
 		done
-		for port in 8080 8081 8082; do
-			local ignored=0
-			if is_ignored_port "$port"; then
-				ignored=1
+		for i in "${!REPLICA_URLS[@]}"; do
+			local base="${REPLICA_URLS[$i]}"
+			local name="${REPLICA_CONTAINERS[$i]}"
+			local stopped=0
+			if is_replica_stopped "$name"; then
+				stopped=1
 			fi
-			local url="http://localhost:${port}/v1/check/${group}"
+			local url="${base}/v1/check/${group}"
 			local out
 			out="$(curl -sS --max-time 2 "$url" || true)"
 			local total reachable redis
@@ -626,22 +763,22 @@ probe_endpoints() {
 			reachable="$(count_reachable "$out")"
 			redis="$(parse_redis_status "$out")"
 			local meta="targets=${total} reachable=${reachable} redis=${redis:-unknown}"
-			echo "check ${port}: ${out} ${meta}" | tee -a "$report"
-			if [[ "$total" -eq 0 && "$ignored" -eq 0 ]]; then
-				echo "check warning: no targets returned on ${port}" | tee -a "$report"
+			echo "check ${name}: ${out} ${meta}" | tee -a "$report"
+			if [[ "$total" -eq 0 && "$stopped" -eq 0 ]]; then
+				echo "check warning: no targets returned on ${name}" | tee -a "$report"
 				if [[ "$allow_redis_error" -eq 0 ]]; then
-					record_failure "empty targets on ${port} group=${group} (${label})"
+					record_failure "empty targets on ${name} group=${group} (${label})"
 					api_ok=0
-					api_notes+=("check empty targets on ${port}")
+					api_notes+=("check empty targets on ${name}")
 				fi
 			elif [[ "$reachable" -eq 0 ]]; then
-				echo "check warning: zero reachable targets on ${port}" | tee -a "$report"
+				echo "check warning: zero reachable targets on ${name}" | tee -a "$report"
 			fi
-			if [[ "$redis" != "ok" && -n "$redis" && "$ignored" -eq 0 && "$allow_redis_error" -eq 0 ]]; then
-				echo "check warning: redis_status=${redis} on ${port}" | tee -a "$report"
-				record_failure "redis_status=${redis} on ${port} group=${group} (${label})"
+			if [[ "$redis" != "ok" && -n "$redis" && "$stopped" -eq 0 && "$allow_redis_error" -eq 0 ]]; then
+				echo "check warning: redis_status=${redis} on ${name}" | tee -a "$report"
+				record_failure "redis_status=${redis} on ${name} group=${group} (${label})"
 				api_ok=0
-				api_notes+=("redis_status ${redis} on ${port}")
+				api_notes+=("redis_status ${redis} on ${name}")
 			fi
 		done
 	done
@@ -651,6 +788,8 @@ probe_endpoints() {
 		add_check "api" "endpoint probe ${label}" "fail" "$(IFS='; '; echo "${api_notes[*]}")"
 	fi
 }
+
+# --- Metrics ---
 
 metrics_sum() {
 	local body="$1"
@@ -689,30 +828,32 @@ probe_metrics() {
 	local metrics_notes=()
 	echo "" | tee -a "$report"
 	echo "metrics probe: $label" | tee -a "$report"
-	for port in 8080 8081 8082; do
-		local ignored=0
-		if is_ignored_port "$port"; then
-			ignored=1
+	for i in "${!REPLICA_URLS[@]}"; do
+		local base="${REPLICA_URLS[$i]}"
+		local name="${REPLICA_CONTAINERS[$i]}"
+		local stopped=0
+		if is_replica_stopped "$name"; then
+			stopped=1
 		fi
-		local url="http://localhost:${port}/metrics"
+		local url="${base}/metrics"
 		local body
 		body="$(curl -sS --max-time 2 "$url" || true)"
 		if [[ -z "$body" ]]; then
-			echo "metrics ${port}: (no data)" | tee -a "$report"
-			if [[ "$ignored" -eq 0 ]]; then
+			echo "metrics ${name}: (no data)" | tee -a "$report"
+			if [[ "$stopped" -eq 0 ]]; then
 				metrics_ok=0
-				metrics_notes+=("missing metrics on ${port}")
+				metrics_notes+=("missing metrics on ${name}")
 			fi
-			METRICS_SAMPLES+=("${label}|${port}|0|0|0|0|0|0")
+			METRICS_SAMPLES+=("${label}|${name}|0|0|0|0|0|0")
 			continue
 		fi
-		echo "metrics ${port}:" | tee -a "$report"
+		echo "metrics ${name}:" | tee -a "$report"
 		echo "$body" | rg -e '^lb_requests_total' -e '^lb_errors_total' -e '^check_requests_total' -e '^check_targets_total' -e '^lb_latency_ms_(sum|count)' -e '^check_latency_ms_(sum|count)' -e '^probe_runs_total' -e '^probe_write_errors_total' | tee -a "$report" || true
 		local snapshot
 		snapshot="$(metrics_snapshot "$body")"
 		local req_total req_hit req_miss err_total check_total check_targets probe_runs
 		IFS='|' read -r req_total req_hit req_miss err_total check_total check_targets probe_runs <<< "$snapshot"
-		local key_base="port_${port}"
+		local key_base="replica_${name}"
 		local last="${METRICS_LAST[$key_base]:-}"
 		local now
 		now="$(date +%s)"
@@ -735,8 +876,8 @@ probe_metrics() {
 				err_per_sec="$(awk -v e="$err_d" -v t="$dt" 'BEGIN{printf "%.2f", (e/t)}')"
 			fi
 		fi
-		echo "metrics delta ${port}: lb_req=${req_d} hit%=${hit_rate} err%=${err_rate} err/s=${err_per_sec} check_req=${check_d} probe_runs=${probe_d}" | tee -a "$report"
-		METRICS_SAMPLES+=("${label}|${port}|${req_d}|${hit_d}|${err_d}|${check_d}|${probe_d}|${dt}")
+		echo "metrics delta ${name}: lb_req=${req_d} hit%=${hit_rate} err%=${err_rate} err/s=${err_per_sec} check_req=${check_d} probe_runs=${probe_d}" | tee -a "$report"
+		METRICS_SAMPLES+=("${label}|${name}|${req_d}|${hit_d}|${err_d}|${check_d}|${probe_d}|${dt}")
 		METRICS_LAST[$key_base]="$snapshot"
 		METRICS_LAST_TS[$key_base]="$now"
 	done
@@ -747,6 +888,8 @@ probe_metrics() {
 		add_check "metrics" "metrics probe ${label}" "fail" "$(IFS='; '; echo "${metrics_notes[*]}")"
 	fi
 }
+
+# --- Load testing ---
 
 run_siege() {
 	local label="$1"
@@ -784,29 +927,74 @@ run_siege() {
 	fi
 }
 
+# --- Health probe ---
+
 probe_health() {
 	local label="$1"
 	local ok=1
 	local notes=()
 	echo "" | tee -a "$report"
 	echo "health probe: $label" | tee -a "$report"
-	for port in 8080 8081 8082; do
-		local url="http://localhost:${port}/health"
+	for i in "${!REPLICA_URLS[@]}"; do
+		local url="${REPLICA_URLS[$i]}/health"
+		local name="${REPLICA_CONTAINERS[$i]}"
 		if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
-			echo "health ${port}: ok" | tee -a "$report"
+			echo "health ${name}: ok" | tee -a "$report"
 		else
-			echo "health ${port}: fail" | tee -a "$report"
+			echo "health ${name}: fail" | tee -a "$report"
 			ok=0
-			notes+=("${port}")
-			record_failure "health failed on ${port}"
+			notes+=("${name}")
+			record_failure "health failed on ${name}"
 		fi
 	done
 	if [[ "$ok" -eq 1 ]]; then
 		add_check "api" "health probe ${label}" "pass"
 	else
-		add_check "api" "health probe ${label}" "fail" "ports=$(IFS=','; echo "${notes[*]}")"
+		add_check "api" "health probe ${label}" "fail" "replicas=$(IFS=','; echo "${notes[*]}")"
 	fi
 }
+
+# --- Stabilize & prepare ---
+
+bench_stabilize() {
+	if [[ "$STABILIZE_ON_START" != "true" ]]; then
+		return
+	fi
+	if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
+		echo "waiting for Redis lock leader (or all-replica probes if Redis is down)..." | tee -a "$report"
+		if ! wait_for_leader; then
+			echo "leader did not converge in time" | tee -a "$report"
+			record_failure "leader did not converge on start"
+			emit_leader_logs "startup"
+			add_check "leader" "leader converge (startup)" "fail"
+		else
+			add_check "leader" "leader converge (startup)" "pass"
+		fi
+	fi
+	if [[ "$WAIT_FOR_CHECKS" == "true" ]]; then
+		echo "waiting for non-empty check results..." | tee -a "$report"
+		if ! wait_for_checks; then
+			echo "checks did not become ready in time" | tee -a "$report"
+			record_failure "checks did not become ready on start"
+			add_check "api" "checks ready (startup)" "fail"
+		else
+			add_check "api" "checks ready (startup)" "pass"
+		fi
+	fi
+}
+
+bench_prepare() {
+	bench_detect_compose
+	bench_init_report
+	bench_require_cmds
+	bench_compose_up
+	bench_discover
+	bench_collect_groups
+	bench_wait_lb
+	bench_stabilize
+}
+
+# --- Summary / finish ---
 
 status_label() {
 	local status="$1"
@@ -854,8 +1042,8 @@ print_metrics_summary() {
 	local -A req_sum hit_sum err_sum check_sum probe_sum dt_sum dt_count
 	local labels=()
 	for entry in "${METRICS_SAMPLES[@]}"; do
-		local label port req_d hit_d err_d check_d probe_d dt
-		IFS='|' read -r label port req_d hit_d err_d check_d probe_d dt <<< "$entry"
+		local label name req_d hit_d err_d check_d probe_d dt
+		IFS='|' read -r label name req_d hit_d err_d check_d probe_d dt <<< "$entry"
 		if [[ -z "${req_sum[$label]+x}" ]]; then
 			labels+=("$label")
 			req_sum[$label]=0
@@ -903,33 +1091,43 @@ print_metrics_summary() {
 	done
 }
 
-print_summary() {
-	local out="${1:-/dev/stdout}"
-	{
+print_summary_impl() {
+	echo ""
+	echo "Benchmark Summary"
+	echo "timestamp: ${timestamp}"
+	echo "group: ${GROUP} base_url: ${BASE_URL}"
+	echo "concurrency: ${CONCURRENCY} duration: ${DURATION} stop_target: ${STOP_TARGET}"
+	echo "replicas: ${#REPLICA_CONTAINERS[@]}"
+	if [[ "$FAIL" -eq 0 ]]; then
+		echo "overall: PASS"
+	else
+		echo "overall: FAIL"
+	fi
+	print_checks_section "steps" "Process Steps"
+	print_checks_section "leader" "Leader / lock"
+	print_checks_section "api" "API"
+	print_checks_section "metrics" "Metrics"
+	print_checks_section "load" "Load"
+	print_checks_section "multi_group" "Multi-Group"
+	print_checks_section "leak" "Leak Detection"
+	print_checks_section "stress" "Stress"
+	print_metrics_summary
+	if [[ "${#FAILURES[@]}" -gt 0 ]]; then
 		echo ""
-		echo "Benchmark Summary"
-		echo "timestamp: ${timestamp}"
-		echo "group: ${GROUP} base_url: ${BASE_URL}"
-		echo "concurrency: ${CONCURRENCY} duration: ${DURATION} stop_target: ${STOP_TARGET}"
-		if [[ "$FAIL" -eq 0 ]]; then
-			echo "overall: PASS"
-		else
-			echo "overall: FAIL"
-		fi
-		print_checks_section "steps" "Process Steps"
-		print_checks_section "raft" "Raft"
-		print_checks_section "api" "API"
-		print_checks_section "metrics" "Metrics"
-		print_checks_section "load" "Load"
-		print_metrics_summary
-		if [[ "${#FAILURES[@]}" -gt 0 ]]; then
-			echo ""
-			echo "Failures"
-			for msg in "${FAILURES[@]}"; do
-				echo "- ${msg}"
-			done
-		fi
-	} >>"$out"
+		echo "Failures"
+		for msg in "${FAILURES[@]}"; do
+			echo "- ${msg}"
+		done
+	fi
+}
+
+# Use >&1 for terminal output: opening /dev/stdout for append breaks on some environments (e.g. WSL) when fd 1 is redirected.
+print_summary() {
+	if [[ -n "${1:-}" ]]; then
+		print_summary_impl >>"$1"
+	else
+		print_summary_impl >&1
+	fi
 }
 
 bench_finish() {

@@ -110,7 +110,8 @@ func TestRunHTTPProbeSuccess(t *testing.T) {
 		RedisTTL:     2 * time.Second,
 	}
 
-	res := runHTTPProbe(context.Background(), target)
+	client := buildHTTPClient(target)
+	res := runHTTPProbe(context.Background(), target, client)
 	if !res.Reachable {
 		t.Fatalf("expected reachable, got %#v", res)
 	}
@@ -146,7 +147,8 @@ func TestRunHTTPProbeFailsStatus(t *testing.T) {
 		RedisTTL:     2 * time.Second,
 	}
 
-	res := runHTTPProbe(context.Background(), target)
+	client := buildHTTPClient(target)
+	res := runHTTPProbe(context.Background(), target, client)
 	if res.Reachable {
 		t.Fatalf("expected unreachable on 500")
 	}
@@ -186,7 +188,8 @@ func TestRunHTTPProbeMethodHeaders(t *testing.T) {
 		RedisTTL:     2 * time.Second,
 	}
 
-	res := runHTTPProbe(context.Background(), target)
+	client := buildHTTPClient(target)
+	res := runHTTPProbe(context.Background(), target, client)
 	if !res.Reachable {
 		t.Fatalf("expected reachable, got %#v", res)
 	}
@@ -214,7 +217,8 @@ func TestRunHTTPProbeBasicAuth(t *testing.T) {
 		RedisTTL:      2 * time.Second,
 	}
 
-	res := runHTTPProbe(context.Background(), target)
+	client := buildHTTPClient(target)
+	res := runHTTPProbe(context.Background(), target, client)
 	if !res.Reachable {
 		t.Fatalf("expected reachable, got %#v", res)
 	}
@@ -240,7 +244,8 @@ func TestRunHTTPProbeBearerAuth(t *testing.T) {
 		RedisTTL:     2 * time.Second,
 	}
 
-	res := runHTTPProbe(context.Background(), target)
+	client := buildHTTPClient(target)
+	res := runHTTPProbe(context.Background(), target, client)
 	if !res.Reachable {
 		t.Fatalf("expected reachable, got %#v", res)
 	}
@@ -263,7 +268,8 @@ func TestRunHTTPProbeNoRedirect(t *testing.T) {
 		RedisTTL:        2 * time.Second,
 	}
 
-	res := runHTTPProbe(context.Background(), target)
+	client := buildHTTPClient(target)
+	res := runHTTPProbe(context.Background(), target, client)
 	if res.Reachable {
 		t.Fatalf("expected unreachable on redirect without follow")
 	}
@@ -287,7 +293,8 @@ func TestRunHTTPProbeMaxRedirects(t *testing.T) {
 		RedisTTL:        2 * time.Second,
 	}
 
-	res := runHTTPProbe(context.Background(), target)
+	client := buildHTTPClient(target)
+	res := runHTTPProbe(context.Background(), target, client)
 	if res.Reachable {
 		t.Fatalf("expected unreachable on max redirects")
 	}

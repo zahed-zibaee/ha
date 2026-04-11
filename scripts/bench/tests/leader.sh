@@ -9,14 +9,14 @@ bench_parse_args "$@"
 bench_prepare
 
 if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
-	echo "waiting for single leader..." | tee -a "$report"
+	echo "waiting for Redis lock leader (or degraded probes if Redis down)..." | tee -a "$report"
 	if ! wait_for_leader; then
 		echo "leader did not converge in time" | tee -a "$report"
 		record_failure "leader did not converge: leader-only"
 		emit_leader_logs "leader-only"
-		add_check "raft" "leader converge" "fail"
+		add_check "leader" "leader converge" "fail"
 	else
-		add_check "raft" "leader converge" "pass"
+		add_check "leader" "leader converge" "pass"
 	fi
 fi
 

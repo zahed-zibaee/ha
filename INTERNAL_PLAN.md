@@ -1,141 +1,215 @@
-# HA Health Checker & LB – Engineer Notes
+# HA Health Checker & LB - Internal engineering reference
 
-Working doc for building a Raft-backed HA health-check service in Go. Audience: engineers only (not user-facing).
+Audience: maintainers and operators.  
+For user-facing setup details, see `README.md`.
 
-## Goal
-- Run N instances in a Raft cluster; only the leader executes health checks and writes results to Redis with TTL per target.
-- Followers serve HTTP APIs using cached Redis data (and config fallback for LB) to avoid duplicate checks.
-- Health checks are **HTTP-only** in the current implementation.
-- APIs:
-  - `GET /v1/check/{group}` → JSON of all targets in that group with reachability flags + freshness metadata.
-  - `GET /v1/lb/{group}` → returns one target chosen randomly or round-robin among reachable ones; if none reachable/Redis down, still return a record with `reachable=false` and error reason.
-  - `GET /v1/leader`, `POST /v1/raft/join`, `GET /metrics`, `GET /health`.
+---
 
-## High-Level Architecture
-- Go module `github.com/<org>/ha-health` (set when initializing go mod).
-- Packages:
-  - `raftnode`: bootstrap/join Raft, expose leadership state + start/stop leader-only jobs.
-  - `config`: load/validate env and YAML into structs.
-  - `checks`: HTTP probe runner (leader-only).
-  - `redisstore`: thin wrapper around go-redis with tuned pool/timeouts.
-  - `api`: HTTP server exposing `/v1/check/`, `/v1/lb/`, `/v1/leader`, `/metrics`, `/health`.
-- Data flow:
-  - On startup, node joins/creates Raft cluster; once leader, spawns check goroutines; on leadership loss, cancels them.
-  - Each HTTP check goroutine loops: run probe → write minimal JSON into Redis hash `hc:{group}` field=`{target}` and maintain `hc:{group}:up` set with TTL/backoff/jitter.
-  - API handlers read group hashes; LB path prefers cached/hydrated data and only hits Redis when cache is stale.
+## 1) Product goals
 
-## Raft Notes
-- Uses `github.com/hashicorp/raft` with in-memory transport (no disk persistence).
-- Config via env: `RAFT_NODE_ID`, `RAFT_BIND_ADDR`, `RAFT_PEERS`.
-- Only leader writes Redis; followers skip scheduling. API endpoints always available; followers strictly read Redis.
-- Rejoin flow (no volumes): nodes call `POST /v1/raft/join` using `RAFT_JOIN_ADDRS`. Set `RAFT_BOOTSTRAP=true` on one node so it can form a cluster if no leader exists. `RAFT_JOIN_TIMEOUT` controls retry window.
+1. Single probe writer: only one replica should actively run health checks in steady state.
+2. Highly available read path: every replica serves `/v1/lb` and related APIs.
+3. Graceful degradation: `/v1/lb` should still return useful output during Redis trouble (cache + config fallback).
+4. Keep deployment simple: no extra proxy service in default Compose.
+5. Keep coordination simple: Redis lock instead of a consensus subsystem.
 
-## Redis Interaction
-- Library: `github.com/redis/go-redis/v9` tuned for HA: pool size 100, read timeout 1s, write timeout 500ms; semaphore 256 to avoid local stampede.
-- Storage: Hash per group `hc:{group}`; field=`target name`; value JSON `{reachable,status,checked_at,error,latency_ms,type,target}` (target name only). Connection data is hydrated from in-process config map to keep payloads small.
-- Up set: `hc:{group}:up` is a **sorted set** keyed by target name with score=latency_ms (lower is better). Used for fast-path selection and weighting; expires with the hash. Weighted selection builds a latency-bucketed pool (1–10) capped at 1000 entries.
-- LB behavior:
-  - Cache-first (max age fixed at **5s**, not configurable).
-  - If cache stale: use `:up` fast path when available (ZSET), else `HGETALL`.
-  - On Redis errors: short backoff and fallback to config-hydrated targets.
-  - `/v1/lb` responses are flattened (`group`, `reachable`, `name`, `error` + optional fields).
-  - Response overrides are configured via `lb.response_targets[].response` and replace target data fields.
-- `/v1/check` returns `redis_status=error` when Redis is down (no fallback payload).
+Non-goals for v1:
 
-## Health Check Types (Current Implementation)
-- **HTTP URL** (only implemented check type)
-  - Fields: `url`, `name`, `interval`, `timeout`, `retry`, `redis_ttl`, `response` (expected status list)
-  - HTTP options: `method`, `headers`, `auth_basic_user`, `auth_basic_pass`, `auth_bearer`, `follow_redirects`, `max_redirects`.
-  - Implementation: HTTP request with per-target timeout; record latency.
+- persisted consensus log/state
+- Redis Sentinel in default stack
+- non-HTTP check types
 
-## Configuration Model
-- Primary source: YAML (`config-targets.yaml`), env overrides for small setups.
+---
 
-Example:
-```yaml
-default:
-  interval: 10s
-  timeout: 2s
-  redisTTL: 15s
-  retry: 1
+## 2) Package layout
 
-checks:
-  web-health:
-    type: http
-    interval: 8s
-    timeout: 2s
-    redisTTL: 15s
-    retry: 1
-    startTogether: true
-    targets:
-      - name: public-health
-        url: https://example.com/health
-        response: 200,204
-        headers:
-          User-Agent: ha-health
-      - name: basic-auth-health
-        url: https://example.com/private/health
-        auth_basic_user: user
-        auth_basic_pass: pass
-        method: GET
-      - name: no-redirect
-        url: https://example.com/redirect
-        follow_redirects: false
-        response: 302
-    lb:
-      type: round-robin
-      response_targets:
-        - name: public-health
-          response:
-            url: https://example.com/home
-            bucket: my-bucket
-            description: "Custom LB response for public-health"
+Go module: `ha`
+
+| Package | Responsibility |
+|---------|----------------|
+| `cmd` | Process wiring, Redis lock leadership loop, HTTP server startup, probe lifecycle. |
+| `api` | HTTP handlers, LB resolution, Redis reads, cache layers, Prometheus metrics. |
+| `checks` | HTTP probe loops and Redis write path (`HSET`, `ZADD/ZREM`, `EXPIRE`). |
+| `config` | YAML parsing + validation. |
+| `redisstore` | Redis client config from env (`FromEnv`, `NewClient`, `Ping`). |
+| `envutil` | Environment helper (`GetDefault`). |
+| `logger` | `slog` configuration. |
+
+---
+
+## 3) Runtime architecture
+
+### 3.1 Main goroutines
+
+1. Main goroutine waits for shutdown signals.
+2. HTTP server goroutine serves API endpoints.
+3. Leader loop goroutine (`leaderLoop`) acquires/renews Redis lock and starts/stops checks.
+4. Per-group check goroutines created by `checks.StartHTTPGroup` when leadership is active.
+
+### 3.2 Data flow
+
+```mermaid
+sequenceDiagram
+  participant L as Lock Owner
+  participant R as Redis
+  participant F as Follower API
+  participant C as Client
+  L->>L: Probe targets (HTTP)
+  L->>R: HSET hc:group + ZADD hc:group:up + EXPIRE
+  C->>F: GET /v1/lb/group
+  F->>R: optional ZRANGE/HGETALL
+  F->>C: LB JSON
 ```
 
-Defaults:
-- `follow_redirects` defaults to true.
-- `max_redirects` defaults to 10.
-- `startTogether` is enforced true (policy).
+### 3.3 Leadership model (Redis lock)
 
-## Concurrency & Lifecycle
-- Leader starts/stops per-target goroutines based on leadership state.
-- For each group, targets launch together; each goroutine uses its own ticker/timeout/retry budget.
-- Small jitter (5%) to avoid thundering herd.
-- Redis write retries with capped backoff.
+Constants in `cmd/main.go`:
 
-## HTTP API Behavior
-- Server has read/write/idle timeouts and header limits.
-- `/v1/check/{group}`: Reads hash and hydrates from local config; on Redis error returns `redis_status=error` and message.
-- `/v1/lb/{group}`:
-  - Strategy: `LB_STRATEGY` random | round-robin | weighted (latency-based) | weighted-rr (latency-weighted round-robin).
-  - Per-group override via `checks.<group>.lb.type`.
-  - Cache-first with fixed 5s max age.
-  - Uses `:up` fast path; falls back to full hash or config on errors.
-  - Response is flattened; override fields come from `lb.response_targets`.
-- `/v1/leader`, `/metrics`, `/health` provided for ops/visibility.
+- `leaderLockKey = "ha:leader"`
+- `leaderLockTTL = 10s`
+- `leaderRenewEvery = 5s`
+- `leaderRedisTimeout = 2s`
 
-## Metrics (Prometheus)
-- `lb_requests_total{path,cache_hit}`
-- `lb_latency_ms{path}`
-- `lb_errors_total{type}`
-- `check_requests_total{redis_status}`
-- `check_latency_ms{redis_status}`
-- `check_targets_total{redis_status}`
-- `probe_runs_total{check_type}`
-- `probe_write_errors_total{check_type}`
+Acquire path:
 
-## Testing / Bench
-- Unit tests: config loader, HTTP probe, API cache/LB fallback.
-- Bench scripts: `scripts/bench/tests/*.sh`.
-  - Full suite: `./scripts/bench/tests/massive.sh`.
-  - Distribution test is warn-only by default; set `LB_DIST_STRICT=true` to enforce.
+- try `SET key nodeID NX EX 10`
+- if not acquired, read current owner
+- if owner is self (restart race), reclaim via owner-checked renew
 
-## Containers / Compose
-- Dockerfile: multi-stage builder -> alpine runtime, binary at `/app/ha`.
-- `docker-compose.yml`: three app nodes + redis; mounts `config-targets.yaml` into `/app/config-targets.yaml`; exposes HTTP ports 8080/8081/8082 and raft ports 12000/12001/12002.
+Renew path:
 
-## Future Work (Not Implemented Yet)
-- Additional check types: bucket/object (S3), TCP, DNS, ICMP ping, TLS cert expiry, gRPC health.
-- Optional config reload on SIGHUP.
-- API authn/authz.
-- Persisted Raft logs/snapshots (env `RAFT_DATA_DIR`).
+- Lua script validates owner (`GET key == nodeID`)
+- if owner matches, `EXPIRE key 10`
+- if renew fails with a **Redis error**, stop checks then immediately **restart checks without holding the lock** (all replicas do this until Redis is healthy again)
+- if renew succeeds but **ownership is lost** (another node holds the key), stop checks and remain a follower
+
+Operational trade-off:
+
+- while Redis is down, **all replicas** run HTTP probes (duplicate outbound checks; Redis writes fail)
+- brief duplicate probing is also acceptable during edge races when Redis is up
+- simplicity is prioritized over strict single-writer behavior under severe failure
+
+---
+
+## 4) Probe lifecycle
+
+`leaderLoop` controls probing:
+
+- On **Redis lock** gain (`SET NX` or reclaim):
+  - update snapshot (`leader=true`, `probes_active=true`)
+  - create cancellable context
+  - run `startChecks` for all HTTP groups
+- On lock loss **with Redis still reachable** (stolen lock):
+  - cancel context, drain waitgroups
+  - snapshot `leader=false`, `probes_active=false`
+- On **Redis errors** while holding or acquiring the lock:
+  - cancel prior probe context if any, then start checks again
+  - snapshot `leader=false`, `probes_active=true`, `status=degraded` via HTTP
+
+`startChecks` only starts groups with `type: http`.
+
+---
+
+## 5) API behavior
+
+### 5.1 Endpoints
+
+- `/v1/lb/{group}`: primary client endpoint (resilient fallback chain)
+- `/v1/check/{group}`: informational endpoint (shows Redis read errors honestly)
+- `/v1/leader`: `leader` (holds Redis lock), `probes_active`, `status` (`leader` / `follower` / `degraded`), `node_id`, `since_unix`
+- `/metrics`: Prometheus metrics
+- `/health`: process liveness (`{"status":"ok"}`)
+
+
+### 5.2 `/v1/lb` resolution order
+
+1. fresh LB cache
+2. Redis backoff + config fallback
+3. strategy-specific fast paths (`:up` zset)
+4. full `HGETALL` hydrate path
+5. config-only fallback
+
+`/v1/lb` intentionally returns HTTP 200 with structured JSON even during backend failure.
+
+---
+
+## 6) Redis data model
+
+| Key | Type | Content |
+|-----|------|---------|
+| `ha:leader` | String | Current lock owner (`node_id`) with TTL. |
+| `hc:{group}` | Hash | `target -> probeResult JSON`. |
+| `hc:{group}:up` | Sorted set | Reachable targets, score = latency ms. |
+
+TTL behavior:
+
+- probe keys use per-target `redis_ttl`
+- leader lock uses fixed 10s TTL
+
+---
+
+## 7) Testing and scripts
+
+### 7.2 Bench scripts
+
+`scripts/bench/lib/common.sh` discovers dynamic replicas and probes each container IP.
+
+Leader probing checks:
+
+- `leader`
+- `status`
+- `node_id`
+
+
+---
+
+## 8) Compose deployment
+
+Reference `docker-compose.yml`:
+
+- one `redis` service
+- one `ha` service with `deploy.replicas: 3`
+- env includes Redis + app settings only
+- only HTTP port exposed for `ha`
+
+---
+
+## 9) Failure model
+
+- Redis down:
+  - lock acquire/renew fails on every replica
+  - **all replicas run probes** (`probes_active=true`, `status=degraded`); Redis writes fail until recovery
+  - `/v1/check` shows Redis errors
+  - `/v1/lb` can still serve cache/config fallback
+- Leader crash:
+  - lock expires in about 10s
+  - another replica acquires lock and resumes probes
+- short network blips:
+  - temporary leadership churn possible
+  - short overlap in probing is acceptable
+
+---
+
+## 10) Future work
+
+- optional lock tuning via env (`LOCK_TTL`, `LOCK_RENEW_EVERY`)
+- additional check types (TCP, DNS, TLS, gRPC)
+- config hot reload
+- API authn/authz
+- optional Redis HA mode if operating conditions require it
+
+---
+
+## 11) File map
+
+| Path | Notes |
+|------|------|
+| `cmd/main.go` | Startup, leader lock loop, probe lifecycle. |
+| `api/*.go` | HTTP API + LB resolution + cache behavior. |
+| `checks/http.go` | Probe execution and Redis writes. |
+| `redisstore/redisstore.go` | Redis client setup. |
+| `docker-compose.yml` | 3x `ha` replicas + Redis. |
+| `scripts/bench/lib/common.sh` | Shared bench logic and replica discovery. |
+
+This document explains why the system is shaped this way.  
+`README.md` remains the runbook for setup and day-to-day usage.

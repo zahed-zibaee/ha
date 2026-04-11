@@ -3,10 +3,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
-: "${MASSIVE_TESTS:=consistency leader health api loadbalancer distribution latency concurrency resilience redis_flap cold_start churn chaos}"
+# All sub-tests use scripts/bench/docker-compose.test.yml + config-targets.test.yaml (see bench_defaults in common.sh).
+# Override with MASSIVE_TESTS="..." or COMPOSE_FILE / BENCH_CONFIG when invoking a single test.
+: "${MASSIVE_TESTS:=consistency leader health api loadbalancer distribution latency concurrency resilience redis_flap cold_start churn chaos concurrent_chaos_load dns_failover leader_kill_during_probes full_restart multi_group goroutine_leak multi_group_stress}"
 : "${MASSIVE_KEEP_REPORTS:=false}"
 : "${MASSIVE_VERBOSE:=false}"
-: "${MASSIVE_PROGRESS_INTERVAL:=15}"
+# Seconds between heartbeats while a sub-test runs (0 = disable). Sleeps once before the first line.
+: "${MASSIVE_PROGRESS_INTERVAL:=20}"
+# distribution.sh alone uses 1000 samples + long sleeps (~5m); under massive we shorten (override freely).
+: "${MASSIVE_DIST_SAMPLES:=400}"
+: "${MASSIVE_DIST_BATCH:=50}"
+: "${MASSIVE_DIST_BATCH_SLEEP:=0}"
 
 now_ts() {
 	date -u +%Y-%m-%dT%H:%M:%SZ
@@ -32,7 +39,25 @@ run_test() {
 		extra_env+=("COLD_START_USE_DOWN=false")
 	fi
 	if [[ "$name" == "distribution" ]]; then
-		extra_env+=("LB_DIST_STRICT=false")
+		extra_env+=(
+			"LB_DIST_STRICT=false"
+			"LB_DIST_SAMPLES=${MASSIVE_DIST_SAMPLES}"
+			"LB_DIST_BATCH=${MASSIVE_DIST_BATCH}"
+			"LB_DIST_BATCH_SLEEP=${MASSIVE_DIST_BATCH_SLEEP}"
+		)
+	fi
+	if [[ "$name" == "resilience" ]]; then
+		extra_env+=("WAIT_CHECKS_TIMEOUT=90")
+	fi
+	if [[ "$name" == "full_restart" ]]; then
+		extra_env+=("WAIT_CHECKS_TIMEOUT=90" "BENCH_WAIT_URL_TRIES=60")
+	fi
+	if [[ "$name" == "cold_start" ]]; then
+		extra_env+=("BENCH_WAIT_URL_TRIES=60" "WAIT_CHECKS_TIMEOUT=90")
+	fi
+	if [[ "$name" == "chaos" ]]; then
+		# Leader loop ticks every 5s; need time for degraded (all-probe) mode after Redis stops.
+		extra_env+=("CHAOS_SLEEP=8")
 	fi
 	if [[ "$MASSIVE_VERBOSE" == "true" ]]; then
 		PRINT_SUMMARY=true PRINT_RAW_REPORT=true KEEP_REPORT=true REPORT_FILE="$report" env "${extra_env[@]}" "$path" "$@" 1>&2 || status=$?
@@ -45,17 +70,28 @@ run_test() {
 tmp_dir="$(mktemp -d -t ha-bench-massive-XXXXXX)"
 declare -a tests reports statuses summaries overalls failures durations
 
+echo "" >&2
+echo "massive: running ${MASSIVE_TESTS// /, }" >&2
+echo "massive: each sub-test uses COMPOSE_FILE=scripts/bench/docker-compose.test.yml from repo root; first run may take several minutes (image build + health waits)." >&2
+echo "massive: live sub-test logs: MASSIVE_VERBOSE=true $0   |   reuse images: $0 --no-build   |   heartbeats every ${MASSIVE_PROGRESS_INTERVAL}s (MASSIVE_PROGRESS_INTERVAL=0 to disable)" >&2
+echo "massive: per-test log file e.g. tail -f ${tmp_dir}/consistency.txt" >&2
+echo "massive: distribution uses LB_DIST_SAMPLES=${MASSIVE_DIST_SAMPLES} (not 1000) so the suite finishes in minutes; run distribution.sh alone for the full sample." >&2
+echo "massive: stack includes mock-target nginx; Redis has no host port (no clash with a dev redis on 6379)." >&2
+echo "" >&2
+
 progress_pid=""
 start_progress() {
 	local name="$1"
 	if [[ "${MASSIVE_PROGRESS_INTERVAL}" -le 0 ]]; then
-		echo "running: ${name}..."
 		return
 	fi
 	(
+		local interval="${MASSIVE_PROGRESS_INTERVAL}"
+		local elapsed=0
 		while true; do
-			echo "running: ${name}..."
-			sleep "$MASSIVE_PROGRESS_INTERVAL"
+			sleep "$interval"
+			elapsed=$((elapsed + interval))
+			echo "massive: still on '${name}' (${elapsed}s) - live log: tail -f the report path printed above (some tests are slow by design, e.g. distribution or siege)." >&2
 		done
 	) &
 	progress_pid=$!
@@ -89,6 +125,7 @@ for t in $MASSIVE_TESTS; do
 	: >"$report"
 	echo ""
 	echo "starting ${t}..."
+	echo "massive: report file ${report} (tail -f for this test's log)" >&2
 	echo "TEST_START name=${t} ts=$(now_ts)"
 	start_epoch="$(now_epoch)"
 	start_progress "$t"

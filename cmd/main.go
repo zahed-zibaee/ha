@@ -1,32 +1,40 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/hashicorp/raft"
 	"github.com/redis/go-redis/v9"
 	"ha/api"
 	"ha/checks"
 	"ha/config"
+	"ha/envutil"
 	"ha/logger"
-	"ha/raftnode"
 	"ha/redisstore"
 )
 
+const (
+	leaderLockKey      = "ha:leader"
+	leaderLockTTL      = 10 * time.Second
+	leaderRenewEvery   = 5 * time.Second
+	leaderRedisTimeout = 2 * time.Second
+)
+
+var renewLeaderLockScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+`)
+
 func main() {
-	logLevel := getenvDefault("LOG_LEVEL", "warn")
-	logFormat := getenvDefault("LOG_FORMAT", "json")
+	logLevel := envutil.GetDefault("LOG_LEVEL", "warn")
+	logFormat := envutil.GetDefault("LOG_FORMAT", "json")
 	logger.Configure(logLevel, logFormat)
 
 	cfg, err := config.Load("")
@@ -43,15 +51,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	raftOpts := raftnode.OptionsFromEnv()
-	r, obsCh, hasState, advAddr, err := raftnode.Start(raftOpts)
-	if err != nil {
-		slog.Error("raft start failed", "err", err)
-		os.Exit(1)
+	nodeID, err := os.Hostname()
+	if err != nil || nodeID == "" {
+		slog.Warn("hostname unavailable; using fallback node id", "err", err)
+		nodeID = "unknown"
 	}
-	leaderCh := r.LeaderCh()
-	go logObservations(obsCh)
-	leaderTracker := newLeaderTracker(r, raftOpts.NodeID)
+	leaderTracker := newLeaderTracker(nodeID)
 
 	redisOpts := redisstore.FromEnv()
 	rawRedis := redisstore.NewClient(redisOpts)
@@ -62,69 +67,36 @@ func main() {
 	}
 
 	logTargets(cfg)
-	go manageChecks(ctx, r, leaderCh, cfg, rawRedis, leaderTracker)
-	joinFn := func(id, addr string) (int, string, error) {
-		if r.State() != raft.Leader {
-			return http.StatusConflict, "", nil
-		}
-		f := r.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, 0)
-		if err := f.Error(); err != nil {
-			if errors.Is(err, raft.ErrNotLeader) || errors.Is(err, raft.ErrLeadershipLost) {
-				return http.StatusConflict, "", err
-			}
-			return http.StatusInternalServerError, "", err
-		}
-		return http.StatusOK, "", nil
-	}
+	go leaderLoop(ctx, rawRedis, nodeID, cfg, leaderTracker)
+
+	listen := envutil.GetDefault("LISTEN_ADDR", ":8080")
 	go func() {
-		listen := getenvDefault("LISTEN_ADDR", ":8080")
-		lbStrategy := getenvDefault("LB_STRATEGY", "random")
+		lbStrategy := envutil.GetDefault("LB_STRATEGY", "random")
 		lbResponses := buildLBResponseIndex(cfg)
 		lbTypes := buildLBTypeIndex(cfg)
-		if err := api.Start(ctx, listen, rawRedis, lbStrategy, targetIndex, lbResponses, lbTypes, leaderTracker.snapshot, joinFn); err != nil {
+		srv := api.NewServer(rawRedis, lbStrategy, targetIndex, lbResponses, lbTypes, leaderTracker.snapshot)
+		if err := srv.Start(ctx, listen); err != nil {
 			slog.Error("http server exited", "err", err)
 			cancelAndExit(stop)
 		}
 	}()
 
-	if !hasState {
-		if raftOpts.Bootstrap {
-			if err := bootstrapSingle(r, raftOpts.NodeID, advAddr); err != nil {
-				slog.Error("raft bootstrap failed", "err", err)
-				cancelAndExit(stop)
-			} else {
-				slog.Info("raft bootstrap complete", "node", raftOpts.NodeID)
-			}
-		} else {
-			go joinLoop(ctx, raftOpts.JoinAddrs, raftOpts.NodeID, advAddr, raftOpts.JoinTimeout)
-		}
-	}
-
-	slog.Info("ha starting (skeleton)", "check_groups", len(cfg.Checks), "raft_node", raftOpts.NodeID, "raft_bind", raftOpts.BindAddr, "log_level", logLevel, "log_format", logFormat)
+	slog.Info("ha starting",
+		"check_groups", len(cfg.Checks),
+		"node_id", nodeID,
+		"leader_lock_key", leaderLockKey,
+		"leader_lock_ttl", leaderLockTTL.String(),
+		"leader_renew_every", leaderRenewEvery.String(),
+		"redis_addr", redisOpts.Addr,
+		"log_level", logLevel,
+		"log_format", logFormat,
+	)
 	<-ctx.Done()
 	slog.Info("shutdown signal received")
 }
 
-func logObservations(ch <-chan raft.Observation) {
-	for o := range ch {
-		switch v := o.Data.(type) {
-		case raft.LeaderObservation:
-			slog.Debug("raft leader observed", "leader", v.LeaderID)
-		case raft.RequestVoteRequest:
-			slog.Debug("raft vote request", "candidate", v.Candidate, "term", v.Term)
-		}
-	}
-}
-
-func getenvDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func startChecks(ctx context.Context, cfg *config.Config, rdb *redis.Client) {
-	// only HTTP checks wired for now
+func startChecks(ctx context.Context, cfg *config.Config, rdb *redis.Client) []*sync.WaitGroup {
+	var wgs []*sync.WaitGroup
 	started := 0
 	for name, chk := range cfg.Checks {
 		if chk.Type != "http" {
@@ -153,12 +125,14 @@ func startChecks(ctx context.Context, cfg *config.Config, rdb *redis.Client) {
 			})
 		}
 		slog.Debug("http check group registered", "group", name, "targets", targetDetails)
-		checks.StartHTTPGroup(ctx, name, chk.Targets, rdb)
+		wg := checks.StartHTTPGroup(ctx, name, chk.Targets, rdb)
+		wgs = append(wgs, wg)
 		started++
 	}
 	if started == 0 {
 		slog.Warn("no runnable check groups (only http supported now); probes not started")
 	}
+	return wgs
 }
 
 func logTargets(cfg *config.Config) {
@@ -231,135 +205,180 @@ func cancelAndExit(stop context.CancelFunc) {
 	os.Exit(1)
 }
 
-func tryJoinCluster(ctx context.Context, addrs []string, nodeID, raftAddr string, timeout time.Duration) bool {
-	if len(addrs) == 0 {
-		return false
-	}
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-	deadline := time.Now().Add(timeout)
-	body := map[string]string{"id": nodeID, "addr": raftAddr}
-	payload, _ := json.Marshal(body)
-	for time.Now().Before(deadline) {
-		for _, addr := range addrs {
-			url := strings.TrimRight(addr, "/") + "/v1/raft/join"
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-			if err != nil {
-				continue
-			}
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				continue
-			}
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				slog.Info("raft join succeeded", "node", nodeID, "addr", raftAddr, "via", addr)
-				return true
-			}
-		}
-		time.Sleep(1 * time.Second)
-	}
-	slog.Warn("raft join failed", "node", nodeID, "addr", raftAddr, "timeout", timeout)
-	return false
-}
+func leaderLoop(parent context.Context, rdb *redis.Client, nodeID string, cfg *config.Config, tracker *leaderTracker) {
+	ticker := time.NewTicker(leaderRenewEvery)
+	defer ticker.Stop()
 
-func joinLoop(ctx context.Context, addrs []string, nodeID, raftAddr string, timeout time.Duration) {
-	if len(addrs) == 0 {
-		slog.Warn("raft join disabled; no join addrs configured", "node", nodeID)
-		return
+	var (
+		cancel    context.CancelFunc
+		activeWgs []*sync.WaitGroup
+		holdsLock bool
+	)
+
+	stopProbeLoops := func(reason string) {
+		if cancel == nil {
+			tracker.setProbesActive(false)
+			return
+		}
+		slog.Info("stopping checks", "node", nodeID, "reason", reason)
+		cancel()
+		cancel = nil
+		for _, wg := range activeWgs {
+			wg.Wait()
+		}
+		activeWgs = nil
+		tracker.setProbesActive(false)
 	}
-	if timeout <= 0 {
-		timeout = 10 * time.Second
+
+	startProbeLoops := func() {
+		if cancel != nil {
+			return
+		}
+		probeCtx, c := context.WithCancel(parent)
+		cancel = c
+		activeWgs = startChecks(probeCtx, cfg, rdb)
+		tracker.setProbesActive(true)
+		slog.Info("starting checks", "node", nodeID, "key", leaderLockKey)
 	}
-	nextLog := time.Now()
+
+	evaluateLeadership := func() {
+		opCtx, opCancel := context.WithTimeout(parent, leaderRedisTimeout)
+		defer opCancel()
+
+		if holdsLock {
+			renewed, err := renewLeaderLock(opCtx, rdb, nodeID)
+			if err != nil {
+				slog.Warn("leader lock renew failed; running checks without lock until Redis recovers", "node", nodeID, "err", err)
+				holdsLock = false
+				tracker.setLockHeld(false)
+				stopProbeLoops("redis_error")
+				startProbeLoops()
+				return
+			}
+			if !renewed {
+				slog.Warn("leader lock lost; stopping checks (another replica holds the lock)", "node", nodeID)
+				holdsLock = false
+				tracker.setLockHeld(false)
+				stopProbeLoops("lock_lost")
+				return
+			}
+			return
+		}
+
+		acquired, err := acquireOrReclaimLeaderLock(opCtx, rdb, nodeID)
+		if err != nil {
+			tracker.setLockHeld(false)
+			if cancel == nil {
+				slog.Warn("leader lock acquire failed; starting checks without Redis lock until Redis recovers", "node", nodeID, "err", err)
+				startProbeLoops()
+			}
+			return
+		}
+		if acquired {
+			holdsLock = true
+			tracker.setLockHeld(true)
+			if cancel == nil {
+				startProbeLoops()
+			}
+			slog.Info("leadership acquired; holding Redis lock and running checks", "node", nodeID, "key", leaderLockKey)
+			return
+		}
+
+		tracker.setLockHeld(false)
+		if cancel != nil {
+			slog.Debug("redis reachable and another replica is leader; stopping local checks", "node", nodeID)
+			stopProbeLoops("follower")
+		}
+	}
+
+	defer func() {
+		stopProbeLoops("shutdown")
+		tracker.setLockHeld(false)
+	}()
+
+	evaluateLeadership()
+
 	for {
-		if ctx.Err() != nil {
+		select {
+		case <-parent.Done():
 			return
+		case <-ticker.C:
+			evaluateLeadership()
 		}
-		if tryJoinCluster(ctx, addrs, nodeID, raftAddr, timeout) {
-			return
-		}
-		if time.Now().After(nextLog) {
-			slog.Warn("raft join failed; will retry", "node", nodeID, "addr", raftAddr, "timeout", timeout)
-			nextLog = time.Now().Add(10 * time.Second)
-		}
-		time.Sleep(2 * time.Second)
 	}
 }
 
-func bootstrapSingle(r *raft.Raft, nodeID, addr string) error {
-	f := r.BootstrapCluster(raft.Configuration{
-		Servers: []raft.Server{
-			{ID: raft.ServerID(nodeID), Address: raft.ServerAddress(addr)},
-		},
-	})
-	return f.Error()
+func acquireOrReclaimLeaderLock(ctx context.Context, rdb *redis.Client, nodeID string) (bool, error) {
+	acquired, err := rdb.SetNX(ctx, leaderLockKey, nodeID, leaderLockTTL).Result()
+	if err != nil {
+		return false, err
+	}
+	if acquired {
+		return true, nil
+	}
+
+	currentOwner, err := rdb.Get(ctx, leaderLockKey).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if currentOwner != nodeID {
+		return false, nil
+	}
+	return renewLeaderLock(ctx, rdb, nodeID)
+}
+
+func renewLeaderLock(ctx context.Context, rdb *redis.Client, nodeID string) (bool, error) {
+	ttlSeconds := int(leaderLockTTL.Seconds())
+	if ttlSeconds <= 0 {
+		ttlSeconds = 1
+	}
+	res, err := renewLeaderLockScript.Run(ctx, rdb, []string{leaderLockKey}, nodeID, ttlSeconds).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
 }
 
 type leaderTracker struct {
-	mu     sync.RWMutex
-	status api.LeaderStatus
+	mu           sync.RWMutex
+	lockHeld     bool
+	probesActive bool
+	nodeID       string
+	since        time.Time
 }
 
-func newLeaderTracker(r *raft.Raft, nodeID string) *leaderTracker {
-	state := r.State()
-	return &leaderTracker{
-		status: api.LeaderStatus{
-			Leader: state == raft.Leader,
-			State:  state.String(),
-			NodeID: nodeID,
-			Since:  time.Now(),
-		},
-	}
+func newLeaderTracker(nodeID string) *leaderTracker {
+	return &leaderTracker{nodeID: nodeID, since: time.Now()}
 }
 
-func (t *leaderTracker) update(r *raft.Raft, isLeader bool) {
+func (t *leaderTracker) setLockHeld(v bool) {
 	t.mu.Lock()
-	t.status.Leader = isLeader
-	t.status.State = r.State().String()
-	t.status.Since = time.Now()
+	if t.lockHeld != v {
+		t.lockHeld = v
+		t.since = time.Now()
+	}
+	t.mu.Unlock()
+}
+
+func (t *leaderTracker) setProbesActive(v bool) {
+	t.mu.Lock()
+	if t.probesActive != v {
+		t.probesActive = v
+		t.since = time.Now()
+	}
 	t.mu.Unlock()
 }
 
 func (t *leaderTracker) snapshot() api.LeaderStatus {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.status
-}
-
-// manageChecks starts/stops probes based on raft leadership.
-func manageChecks(parent context.Context, r *raft.Raft, leaderCh <-chan bool, cfg *config.Config, rdb *redis.Client, tracker *leaderTracker) {
-	var cancel context.CancelFunc
-	if tracker != nil {
-		tracker.update(r, r.State() == raft.Leader)
-	}
-	// handle current state
-	if r.State() == raft.Leader {
-		leaderCtx, c := context.WithCancel(parent)
-		cancel = c
-		slog.Info("starting checks as current leader")
-		startChecks(leaderCtx, cfg, rdb)
-	}
-	for isLeader := range leaderCh {
-		if tracker != nil {
-			tracker.update(r, isLeader)
-		}
-		if isLeader {
-			if cancel != nil {
-				cancel()
-			}
-			leaderCtx, c := context.WithCancel(parent)
-			cancel = c
-			slog.Info("became leader; starting checks")
-			startChecks(leaderCtx, cfg, rdb)
-		} else {
-			if cancel != nil {
-				slog.Warn("lost leadership; stopping checks")
-				cancel()
-				cancel = nil
-			}
-		}
+	return api.LeaderStatus{
+		Leader:       t.lockHeld,
+		ProbesActive: t.probesActive,
+		NodeID:       t.nodeID,
+		Since:        t.since,
 	}
 }

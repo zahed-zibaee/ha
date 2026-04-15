@@ -296,9 +296,10 @@ running_replicas() {
 
 index_of_replica() {
 	local target="$1"
-	for i in "${!REPLICA_CONTAINERS[@]}"; do
-		if [[ "${REPLICA_CONTAINERS[$i]}" == "$target" ]]; then
-			echo "$i"
+	local idx
+	for idx in "${!REPLICA_CONTAINERS[@]}"; do
+		if [[ "${REPLICA_CONTAINERS[$idx]}" == "$target" ]]; then
+			echo "$idx"
 			return
 		fi
 	done
@@ -326,11 +327,12 @@ emit_leader_logs() {
 }
 
 detect_leader() {
-	for i in "${!REPLICA_URLS[@]}"; do
+	local idx
+	for idx in "${!REPLICA_URLS[@]}"; do
 		local body
-		body="$(curl -sS --max-time 2 "${REPLICA_URLS[$i]}/v1/leader" || true)"
+		body="$(curl -sS --max-time 2 "${REPLICA_URLS[$idx]}/v1/leader" || true)"
 		if [[ "$(parse_bool "$body")" == "true" ]]; then
-			echo "${REPLICA_CONTAINERS[$i]}"
+			echo "${REPLICA_CONTAINERS[$idx]}"
 			return
 		fi
 	done
@@ -383,6 +385,33 @@ pick_live_base_url() {
 	echo "$BASE_URL"
 }
 
+base_url_healthy() {
+	local url="${1:-$BASE_URL}"
+	if [[ -z "$url" ]]; then
+		return 1
+	fi
+	curl -fsS --max-time 2 "$url/health" >/dev/null 2>&1
+}
+
+# Reuse the current replica snapshot to select a healthy base URL after leader kills
+# and stop/start churn where the published ports stay stable.
+ensure_live_base_url() {
+	local candidate="${1:-$BASE_URL}"
+	if base_url_healthy "$candidate"; then
+		BASE_URL="$candidate"
+		return 0
+	fi
+	candidate="$(pick_live_base_url "")"
+	if base_url_healthy "$candidate"; then
+		BASE_URL="$candidate"
+		return 0
+	fi
+	if [[ -n "$candidate" ]]; then
+		BASE_URL="$candidate"
+	fi
+	return 1
+}
+
 # Re-discover replica URLs and point BASE_URL at a healthy replica (needed after docker stop/start).
 refresh_live_base_url() {
 	discover_replicas 2>/dev/null || true
@@ -431,7 +460,7 @@ bench_discover() {
 		echo "FATAL: could not discover any ha replicas" >&2
 		exit 1
 	fi
-	if [[ -z "$BASE_URL" ]]; then
+	if ! base_url_healthy "$BASE_URL"; then
 		BASE_URL="$(pick_live_base_url "")"
 	fi
 	echo "base_url=${BASE_URL} replicas=${#REPLICA_CONTAINERS[@]}" | tee -a "$report"
@@ -533,10 +562,18 @@ bench_collect_groups() {
 
 bench_wait_lb() {
 	echo "waiting for lb endpoint..." | tee -a "$report"
-	local lb_ready=1
-	if ! wait_for_url "${BASE_URL}/v1/lb/${GROUP}"; then
+	local lb_ready=0
+	local tries="${BENCH_WAIT_URL_TRIES:-45}"
+	for _ in $(seq 1 "$tries"); do
+		ensure_live_base_url || true
+		if [[ -n "$BASE_URL" ]] && curl -fsS --max-time 2 "${BASE_URL}/v1/lb/${GROUP}" >/dev/null 2>&1; then
+			lb_ready=1
+			break
+		fi
+		sleep 1
+	done
+	if [[ "$lb_ready" -eq 0 ]]; then
 		echo "lb endpoint did not become ready in time" | tee -a "$report"
-		lb_ready=0
 	fi
 	if [[ "$lb_ready" -eq 1 ]]; then
 		add_check "steps" "lb endpoint ready" "pass"
@@ -558,6 +595,11 @@ parse_probes_active() {
 
 # Returns 1 if BASE_URL /v1/check/GROUP reports redis_status error, else 0.
 bench_redis_check_error() {
+	ensure_live_base_url || true
+	if [[ -z "$BASE_URL" ]]; then
+		echo 0
+		return
+	fi
 	local body
 	body="$(curl -sS --max-time 2 "${BASE_URL}/v1/check/${GROUP}" 2>/dev/null || true)"
 	local st
@@ -606,9 +648,10 @@ probe_leaders() {
 	echo "" | tee -a "$report"
 	echo "leader probe: $label" | tee -a "$report"
 	local all_probes=1
-	for i in "${!REPLICA_URLS[@]}"; do
-		local url="${REPLICA_URLS[$i]}/v1/leader"
-		local name="${REPLICA_CONTAINERS[$i]}"
+	local idx
+	for idx in "${!REPLICA_URLS[@]}"; do
+		local url="${REPLICA_URLS[$idx]}/v1/leader"
+		local name="${REPLICA_CONTAINERS[$idx]}"
 		local stopped=0
 		if is_replica_stopped "$name"; then
 			stopped=1
@@ -654,9 +697,10 @@ wait_for_leader() {
 		local count=0
 		local running=0
 		local probes_ok=0
-		for i in "${!REPLICA_URLS[@]}"; do
-			local url="${REPLICA_URLS[$i]}/v1/leader"
-			local name="${REPLICA_CONTAINERS[$i]}"
+		local idx
+		for idx in "${!REPLICA_URLS[@]}"; do
+			local url="${REPLICA_URLS[$idx]}/v1/leader"
+			local name="${REPLICA_CONTAINERS[$idx]}"
 			if is_replica_stopped "$name"; then
 				continue
 			fi
@@ -688,6 +732,11 @@ wait_for_leader() {
 wait_for_checks() {
 	local tries="${WAIT_CHECKS_TIMEOUT}"
 	for _ in $(seq 1 "$tries"); do
+		ensure_live_base_url || true
+		if [[ -z "$BASE_URL" ]]; then
+			sleep 1
+			continue
+		fi
 		local ok=1
 		for group in "${GROUP_LIST[@]}"; do
 			local url="${BASE_URL}/v1/check/${group}"
@@ -722,9 +771,10 @@ probe_endpoints() {
 	echo "endpoint probe: $label" | tee -a "$report"
 	for group in "${GROUP_LIST[@]}"; do
 		echo "group ${group}:" | tee -a "$report"
-		for i in "${!REPLICA_URLS[@]}"; do
-			local base="${REPLICA_URLS[$i]}"
-			local name="${REPLICA_CONTAINERS[$i]}"
+		local idx
+		for idx in "${!REPLICA_URLS[@]}"; do
+			local base="${REPLICA_URLS[$idx]}"
+			local name="${REPLICA_CONTAINERS[$idx]}"
 			local stopped=0
 			if is_replica_stopped "$name"; then
 				stopped=1
@@ -748,9 +798,9 @@ probe_endpoints() {
 				record_failure "lb missing name on ${name} group=${group} (${label})"
 			fi
 		done
-		for i in "${!REPLICA_URLS[@]}"; do
-			local base="${REPLICA_URLS[$i]}"
-			local name="${REPLICA_CONTAINERS[$i]}"
+		for idx in "${!REPLICA_URLS[@]}"; do
+			local base="${REPLICA_URLS[$idx]}"
+			local name="${REPLICA_CONTAINERS[$idx]}"
 			local stopped=0
 			if is_replica_stopped "$name"; then
 				stopped=1
@@ -828,9 +878,10 @@ probe_metrics() {
 	local metrics_notes=()
 	echo "" | tee -a "$report"
 	echo "metrics probe: $label" | tee -a "$report"
-	for i in "${!REPLICA_URLS[@]}"; do
-		local base="${REPLICA_URLS[$i]}"
-		local name="${REPLICA_CONTAINERS[$i]}"
+	local idx
+	for idx in "${!REPLICA_URLS[@]}"; do
+		local base="${REPLICA_URLS[$idx]}"
+		local name="${REPLICA_CONTAINERS[$idx]}"
 		local stopped=0
 		if is_replica_stopped "$name"; then
 			stopped=1
@@ -893,6 +944,11 @@ probe_metrics() {
 
 run_siege() {
 	local label="$1"
+	if ! ensure_live_base_url; then
+		record_failure "no live base url for siege ${label}"
+		add_check "load" "siege ${label}" "fail" "no live base url"
+		return 1
+	fi
 	local url="${BASE_URL}/v1/lb/${GROUP}"
 	local out="$OUT_DIR/siege-${label}.txt"
 	if ! command -v siege >/dev/null 2>&1; then
@@ -935,9 +991,10 @@ probe_health() {
 	local notes=()
 	echo "" | tee -a "$report"
 	echo "health probe: $label" | tee -a "$report"
-	for i in "${!REPLICA_URLS[@]}"; do
-		local url="${REPLICA_URLS[$i]}/health"
-		local name="${REPLICA_CONTAINERS[$i]}"
+	local idx
+	for idx in "${!REPLICA_URLS[@]}"; do
+		local url="${REPLICA_URLS[$idx]}/health"
+		local name="${REPLICA_CONTAINERS[$idx]}"
 		if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
 			echo "health ${name}: ok" | tee -a "$report"
 		else
@@ -1131,6 +1188,8 @@ print_summary() {
 }
 
 bench_finish() {
+	discover_replicas 2>/dev/null || true
+	ensure_live_base_url >/dev/null 2>&1 || true
 	echo "" | tee -a "$report"
 	compose ps | tee -a "$report"
 	echo "report written to $report" | tee -a "$report"

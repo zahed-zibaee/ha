@@ -40,6 +40,7 @@ echo "full_restart: bringing cluster back up" | tee -a "$report"
 bench_compose_up
 sleep 5
 bench_discover
+bench_collect_groups
 
 echo "full_restart: waiting for cluster to reform..." | tee -a "$report"
 if [[ "$WAIT_FOR_LEADER" == "true" ]]; then

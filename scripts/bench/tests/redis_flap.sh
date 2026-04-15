@@ -23,29 +23,29 @@ if [[ "$WAIT_FOR_CHECKS" == "true" ]]; then
 	fi
 fi
 
-for i in $(seq 1 "$REDIS_FLAP_CYCLES"); do
+for cycle in $(seq 1 "$REDIS_FLAP_CYCLES"); do
 	echo "" | tee -a "$report"
-	echo "redis flap cycle ${i}: down" | tee -a "$report"
+	echo "redis flap cycle ${cycle}: down" | tee -a "$report"
 	compose stop redis | tee -a "$report"
-	add_check "steps" "redis stop cycle ${i}" "pass"
+	add_check "steps" "redis stop cycle ${cycle}" "pass"
 	sleep "$REDIS_FLAP_DOWN_SECS"
-	probe_endpoints "redis down cycle ${i}"
-	probe_metrics "redis down cycle ${i}"
+	probe_endpoints "redis down cycle ${cycle}"
+	probe_metrics "redis down cycle ${cycle}"
 
-	echo "redis flap cycle ${i}: up" | tee -a "$report"
+	echo "redis flap cycle ${cycle}: up" | tee -a "$report"
 	compose start redis | tee -a "$report"
-	add_check "steps" "redis start cycle ${i}" "pass"
+	add_check "steps" "redis start cycle ${cycle}" "pass"
 	sleep "$REDIS_FLAP_UP_SECS"
 	if [[ "$WAIT_FOR_CHECKS" == "true" ]]; then
 		if ! wait_for_checks; then
-			record_failure "checks did not become ready after redis flap ${i}"
-			add_check "api" "checks ready after redis flap ${i}" "fail"
+			record_failure "checks did not become ready after redis flap ${cycle}"
+			add_check "api" "checks ready after redis flap ${cycle}" "fail"
 		else
-			add_check "api" "checks ready after redis flap ${i}" "pass"
+			add_check "api" "checks ready after redis flap ${cycle}" "pass"
 		fi
 	fi
-	probe_endpoints "redis up cycle ${i}"
-	probe_metrics "redis up cycle ${i}"
+	probe_endpoints "redis up cycle ${cycle}"
+	probe_metrics "redis up cycle ${cycle}"
 
 done
 

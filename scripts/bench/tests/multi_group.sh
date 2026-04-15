@@ -75,16 +75,13 @@ echo "multi_group summary: pass=${group_pass} fail=${group_fail} total=${#groups
 echo "" | tee -a "$report"
 echo "--- mixed-health failing target check ---" | tee -a "$report"
 mixed_body="$(curl -sS --max-time 3 "${BASE_URL}/v1/check/mixed-health" || true)"
-failing_entry="$(echo "$mixed_body" | rg -o '"target":"failing"[^}]*}' || true)"
-if [[ -z "$failing_entry" ]]; then
-	failing_entry="$(echo "$mixed_body" | rg -o '\{[^}]*"target":"failing"[^}]*\}' || true)"
-fi
-if echo "$failing_entry" | rg -q '"reachable":false'; then
+failing_excerpt="$(echo "$mixed_body" | rg -o '.{0,160}"target":"failing".{0,160}' | head -n1 || true)"
+if echo "$mixed_body" | rg -q '"reachable":false.{0,240}"target":"failing"|"target":"failing".{0,240}"reachable":false'; then
 	echo "mixed-health: failing target correctly marked unreachable" | tee -a "$report"
 	add_check "multi_group" "failing target unreachable" "pass"
 else
-	echo "mixed-health: failing target not marked unreachable: ${failing_entry}" | tee -a "$report"
-	add_check "multi_group" "failing target unreachable" "warn" "entry=${failing_entry}"
+	echo "mixed-health: failing target not marked unreachable: ${failing_excerpt}" | tee -a "$report"
+	add_check "multi_group" "failing target unreachable" "warn" "excerpt=${failing_excerpt}"
 fi
 
 # Cross-group isolation: lb responses should reference group-specific names

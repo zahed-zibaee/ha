@@ -50,8 +50,16 @@ for group in "${groups[@]}"; do
 		ok=0
 		fail=0
 		while [[ $SECONDS -lt $end_time ]]; do
+			base="$(pick_live_base_url "$BASE_URL")"
 			for _ in $(seq 1 "$STRESS_CONCURRENCY_PER_GROUP"); do
-				code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "${BASE_URL}/v1/lb/${group}" 2>/dev/null || echo "000")"
+				code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "${base}/v1/lb/${group}" 2>/dev/null || echo "000")"
+				if [[ "$code" != "200" ]]; then
+					retry_base="$(pick_live_base_url "")"
+					if [[ -n "$retry_base" ]]; then
+						base="$retry_base"
+						code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "${base}/v1/lb/${group}" 2>/dev/null || echo "000")"
+					fi
+				fi
 				if [[ "$code" == "200" ]]; then
 					ok=$((ok + 1))
 				else

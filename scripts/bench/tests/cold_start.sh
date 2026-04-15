@@ -27,6 +27,7 @@ else
 	compose start | tee -a "$report"
 	add_check "steps" "compose start" "pass"
 fi
+bench_discover
 bench_collect_groups
 bench_wait_lb
 

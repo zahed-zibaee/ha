@@ -7,6 +7,7 @@ source "$ROOT_DIR/scripts/bench/lib/common.sh"
 : "${CHAOS_STEPS:=8}"
 : "${CHAOS_SLEEP:=3}"
 : "${CHAOS_REDIS_PROB:=20}"
+: "${CHAOS_RECOVERY_TIMEOUT:=15}"
 
 bench_defaults
 bench_parse_args "$@"
@@ -25,6 +26,21 @@ if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
 fi
 
 redis_down=0
+
+chaos_wait_recovery() {
+	local saved_leader_timeout="${WAIT_LEADER_TIMEOUT}"
+	local saved_checks_timeout="${WAIT_CHECKS_TIMEOUT}"
+	WAIT_LEADER_TIMEOUT="$CHAOS_RECOVERY_TIMEOUT"
+	WAIT_CHECKS_TIMEOUT="$CHAOS_RECOVERY_TIMEOUT"
+	if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
+		wait_for_leader >/dev/null 2>&1 || true
+	fi
+	if [[ "$WAIT_FOR_CHECKS" == "true" ]]; then
+		wait_for_checks >/dev/null 2>&1 || true
+	fi
+	WAIT_LEADER_TIMEOUT="$saved_leader_timeout"
+	WAIT_CHECKS_TIMEOUT="$saved_checks_timeout"
+}
 
 for step in $(seq 1 "$CHAOS_STEPS"); do
 	echo "" | tee -a "$report"
@@ -63,6 +79,10 @@ for step in $(seq 1 "$CHAOS_STEPS"); do
 
 	sleep "$CHAOS_SLEEP"
 	discover_replicas 2>/dev/null || true
+	ensure_live_base_url >/dev/null 2>&1 || true
+	if [[ "$redis_down" -eq 0 ]]; then
+		chaos_wait_recovery
+	fi
 	probe_leaders "chaos step ${step}"
 	label="chaos step ${step}"
 	if [[ "$redis_down" -eq 1 ]]; then

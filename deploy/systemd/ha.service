@@ -1,0 +1,27 @@
+[Unit]
+Description=HA health checker and load-balancer service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ha
+Group=ha
+WorkingDirectory=/opt/ha
+ExecStart=/opt/ha/ha
+Restart=always
+RestartSec=2
+Environment=CONFIG_PATH=/etc/ha/config-targets.yaml
+Environment=LISTEN_ADDR=:8080
+Environment=REDIS_ADDR=127.0.0.1:6379
+Environment=REDIS_DB=0
+Environment=LOG_LEVEL=warn
+Environment=LOG_FORMAT=json
+Environment=LOCK_TTL=10s
+Environment=LOCK_RENEW_EVERY=5s
+Environment=LOCK_REDIS_TIMEOUT=2s
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

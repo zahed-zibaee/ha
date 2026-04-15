@@ -51,22 +51,29 @@ func (s *Server) leaderHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		leader := false
 		probes := false
+		ready := false
 		status := "unknown"
+		reason := ""
 		nodeID := ""
 		var since time.Time
 		if s.leaderFn != nil {
 			ls := s.leaderFn()
 			leader = ls.Leader
 			probes = ls.ProbesActive
+			ready = ls.Ready
+			reason = ls.Reason
 			nodeID = ls.NodeID
 			since = ls.Since
-			switch {
-			case leader:
-				status = "leader"
-			case probes:
-				status = "degraded"
-			default:
-				status = "follower"
+			status = ls.State
+			if status == "" {
+				switch {
+				case leader:
+					status = "leader"
+				case probes:
+					status = "degraded"
+				default:
+					status = "follower"
+				}
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -75,8 +82,29 @@ func (s *Server) leaderHandler() http.Handler {
 			sinceUnix = since.Unix()
 		}
 		_ = json.NewEncoder(w).Encode(leaderResponse{
-			Leader: leader, ProbesActive: probes, Status: status, NodeID: nodeID, SinceUnix: sinceUnix,
+			Leader: leader, ProbesActive: probes, Ready: ready, Status: status, Reason: reason, NodeID: nodeID, SinceUnix: sinceUnix,
 		})
+	})
+}
+
+func (s *Server) readyHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ready := false
+		reason := "initializing"
+		if s.leaderFn != nil {
+			ls := s.leaderFn()
+			ready = ls.Ready
+			if ls.Reason != "" {
+				reason = ls.Reason
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !ready {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "reason": reason})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ready": true, "reason": reason})
 	})
 }
 
@@ -107,7 +135,8 @@ func (s *Server) lbHandler() http.Handler {
 			}
 		}()
 
-		writeLB(w, buildLBResponse(group, result.pick.Reachable, result.pick.Error, &result.pick, s.lbResponses))
+		resp := buildLBResponse(group, result.pick.Reachable, result.pick.Error, result.errType, result.path, &result.pick, s.lbResponses)
+		writeLB(w, result, resp)
 	})
 }
 
@@ -203,12 +232,13 @@ func (s *Server) resolveWeighted(ctx context.Context, group string) lbResult {
 
 	tmap := s.targets[group]
 	hydratedUp := make([]probeResult, 0, len(zs))
+	missingConfig := 0
 	for _, z := range zs {
 		name := fmt.Sprint(z.Member)
 		cfg, found := tmap[name]
 		if !found {
 			s.cache.warnEvery("lb:missing_config:"+group, 5*time.Second, "redis up target missing config", "group", group, "target", name)
-			result.errType = "missing_config"
+			missingConfig++
 			continue
 		}
 		hydratedUp = append(hydratedUp, probeResult{
@@ -234,6 +264,12 @@ func (s *Server) resolveWeighted(ctx context.Context, group string) lbResult {
 	result.reachable = len(hydratedUp)
 	cg := s.cache.lbSet(group, groupData{all: nil, up: hydratedUp}, hydratedUp, hydratedUp)
 	result.pick = pickFromCacheGroup(group, s.selector, cg)
+	// Partial Redis/config mismatch should not mark the request degraded
+	// when we still have valid weighted candidates.
+	if missingConfig > 0 {
+		result.errStr = fmt.Sprintf("ignored_missing_config=%d", missingConfig)
+	}
+	result.errType = "none"
 	return result
 }
 
@@ -375,8 +411,15 @@ func (s *Server) handleEmptyUpSet(group string) lbResult {
 	}
 }
 
-func writeLB(w http.ResponseWriter, resp lbResponse) {
+func writeLB(w http.ResponseWriter, result lbResult, resp lbResponse) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-HA-Path", result.path)
+	w.Header().Set("X-HA-Error-Type", result.errType)
+	if result.errType != "" && result.errType != "none" {
+		w.Header().Set("X-HA-Degraded", "true")
+	} else {
+		w.Header().Set("X-HA-Degraded", "false")
+	}
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
 }

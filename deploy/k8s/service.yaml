@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ha
+  labels:
+    app.kubernetes.io/name: ha
+spec:
+  selector:
+    app.kubernetes.io/name: ha
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: http

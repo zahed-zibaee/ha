@@ -13,6 +13,12 @@ For user-facing setup details, see `README.md`.
 4. Keep deployment simple: no extra proxy service in default Compose.
 5. Keep coordination simple: Redis lock instead of a consensus subsystem.
 
+Reliability profile targets:
+
+- `/v1/lb` availability under chaos >= 99.9%
+- leader convergence budget <= 15s target (30s hard cap)
+- strict release profile treats any degraded warnings as failures
+
 Non-goals for v1:
 
 - persisted consensus log/state
@@ -117,6 +123,7 @@ Operational trade-off:
 - `/v1/lb/{group}`: primary client endpoint (resilient fallback chain)
 - `/v1/check/{group}`: informational endpoint (shows Redis read errors honestly)
 - `/v1/leader`: `leader` (holds Redis lock), `probes_active`, `status` (`leader` / `follower` / `degraded`), `node_id`, `since_unix`
+- `/ready`: readiness endpoint for orchestrators (503 until safe to serve)
 - `/metrics`: Prometheus metrics
 - `/health`: process liveness (`{"status":"ok"}`)
 
@@ -150,15 +157,41 @@ TTL behavior:
 
 ## 7) Testing and scripts
 
-### 7.2 Bench scripts
+### 7.2 Python bench harness
 
-`scripts/bench/lib/common.sh` discovers dynamic replicas and probes each container IP.
+Bench execution is Python-first under `scripts/bench/pybench/`.
 
-Leader probing checks:
+- CLI entrypoint: `python3 -m scripts.bench.pybench.cli`
+- Key commands:
+  - `list` - scenario inventory
+  - `run --scenario <name>` - single scenario execution
+  - `massive` - full-suite regression run
+  - `analyze <report_dir> [--json]` - summarize artifacts
+- policy profiles:
+  - `PYBENCH_PROFILE=pragmatic` for local velocity
+  - `PYBENCH_PROFILE=strict` for release/CI gates
+  - `PYBENCH_STRICT=true` for explicit strict override
 
-- `leader`
-- `status`
-- `node_id`
+Scenario implementations are in `scripts/bench/pybench/scenarios.py`, using:
+
+- environment lifecycle helpers (`env.py`)
+- probe clients and parsers (`probes.py`, `scripts/bench/tools/benchlib/parsing.py`)
+- siege adapter (`load_siege.py`)
+- structured reporting (`reporting.py`)
+
+Massive run artifacts are per-scenario and deterministic:
+
+- `run.json`
+- `events.jsonl`
+- `checks.json`
+- `summary.txt`
+- `summary.json`
+- `attachments/`
+
+Run-level rollups:
+
+- `massive-summary.txt`
+- `massive-summary.json`
 
 
 ---
@@ -171,6 +204,12 @@ Reference `docker-compose.yml`:
 - one `ha` service with `deploy.replicas: 3`
 - env includes Redis + app settings only
 - only HTTP port exposed for `ha`
+- use `/ready` as readiness probe in orchestrated deployments
+
+Kubernetes + systemd references:
+
+- `deploy/k8s/*.yaml`
+- `deploy/systemd/ha.service`
 
 ---
 
@@ -209,7 +248,9 @@ Reference `docker-compose.yml`:
 | `checks/http.go` | Probe execution and Redis writes. |
 | `redisstore/redisstore.go` | Redis client setup. |
 | `docker-compose.yml` | 3x `ha` replicas + Redis. |
-| `scripts/bench/lib/common.sh` | Shared bench logic and replica discovery. |
+| `scripts/bench/pybench/*.py` | Python-first bench runtime, scenarios, reporting, and analysis. |
+| `scripts/bench/tools/massive_runner.py` | Compatibility wrapper to `pybench` massive mode. |
+| `scripts/bench/tools/massive_analyze.py` | Compatibility wrapper to `pybench` analyzer. |
 
 This document explains why the system is shaped this way.  
 `README.md` remains the runbook for setup and day-to-day usage.

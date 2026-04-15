@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ha
+  labels:
+    app.kubernetes.io/name: ha
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ha
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ha
+    spec:
+      containers:
+        - name: ha
+          image: ghcr.io/example/ha:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: CONFIG_PATH
+              value: /app/config-targets.yaml
+            - name: REDIS_ADDR
+              value: ha-redis.default.svc.cluster.local:6379
+            - name: REDIS_DB
+              value: "0"
+            - name: LOG_LEVEL
+              value: warn
+            - name: LOG_FORMAT
+              value: json
+            - name: LOCK_TTL
+              value: 10s
+            - name: LOCK_RENEW_EVERY
+              value: 5s
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /app/config-targets.yaml
+              subPath: config-targets.yaml
+      volumes:
+        - name: config
+          configMap:
+            name: ha-config

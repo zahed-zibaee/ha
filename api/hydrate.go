@@ -44,13 +44,17 @@ func targetMetaFromConfig(cfg config.Target) targetMeta {
 	}
 }
 
-func buildLBResponse(group string, reachable bool, errMsg string, pick *probeResult, overrides map[string]map[string]map[string]any) lbResponse {
+func buildLBResponse(group string, reachable bool, errMsg string, errType string, path string, pick *probeResult, overrides map[string]map[string]map[string]any) lbResponse {
 	resp := lbResponse{
 		"group":     group,
 		"reachable": reachable,
+		"source":    path,
 	}
 	if errMsg != "" {
 		resp["error"] = errMsg
+	}
+	if errType != "" && errType != "none" {
+		resp["error_type"] = errType
 	}
 
 	name := ""

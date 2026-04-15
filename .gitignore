@@ -30,5 +30,11 @@ go.work.sum
 .DS_Store
 Thumbs.db
 
+# Python
+*.pyc
+
 # Configurations
 config-targets.yaml
+
+# Temp
+tmp/

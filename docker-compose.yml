@@ -25,7 +25,6 @@ services:
       LOG_LEVEL: "debug"
       LOG_FORMAT: "text"
       LISTEN_ADDR: ":8080"
-      LB_STRATEGY: "random"
       CONFIG_PATH: "/app/config-targets.yaml"
     ports:
       - "8080"

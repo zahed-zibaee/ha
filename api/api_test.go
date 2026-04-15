@@ -473,6 +473,61 @@ func TestLBWeightedSelectsFromZSET(t *testing.T) {
 	}
 }
 
+func TestLBWeightedPartialMissingConfigDoesNotDegrade(t *testing.T) {
+	rdb := &fakeRedis{
+		zset: map[string]map[string]float64{"hc:g:up": {"fast": 10, "ghost": 900}},
+	}
+	index := map[string]map[string]config.Target{
+		"g": {
+			"fast": {Name: "fast", URL: "https://fast"},
+		},
+	}
+	srv := newTestServer(rdb, "weighted", index, nil)
+	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
+	rr := httptest.NewRecorder()
+	srv.lbHandler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d", rr.Code)
+	}
+	resp := decodeLB(t, rr)
+	if lbString(resp, "name") != "fast" {
+		t.Fatalf("expected fast target, got %#v", resp)
+	}
+	if rr.Header().Get("X-HA-Degraded") != "false" {
+		t.Fatalf("expected non-degraded response, got headers=%v", rr.Header())
+	}
+	if rr.Header().Get("X-HA-Error-Type") != "none" {
+		t.Fatalf("expected X-HA-Error-Type=none, got %q", rr.Header().Get("X-HA-Error-Type"))
+	}
+}
+
+func TestLBWeightedAllMissingConfigUsesConfigFallback(t *testing.T) {
+	rdb := &fakeRedis{
+		zset: map[string]map[string]float64{"hc:g:up": {"ghost": 10}},
+	}
+	index := map[string]map[string]config.Target{
+		"g": {
+			"fast": {Name: "fast", URL: "https://fast"},
+		},
+	}
+	srv := newTestServer(rdb, "weighted", index, nil)
+	req := httptest.NewRequest("GET", "/v1/lb/g", nil)
+	rr := httptest.NewRecorder()
+	srv.lbHandler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d", rr.Code)
+	}
+	if rr.Header().Get("X-HA-Degraded") != "false" {
+		t.Fatalf("expected non-degraded config fallback, got headers=%v", rr.Header())
+	}
+	if rr.Header().Get("X-HA-Error-Type") != "none" {
+		t.Fatalf("expected X-HA-Error-Type=none, got %q", rr.Header().Get("X-HA-Error-Type"))
+	}
+	if rr.Header().Get("X-HA-Path") != "config_fallback" {
+		t.Fatalf("expected config_fallback path, got %q", rr.Header().Get("X-HA-Path"))
+	}
+}
+
 func TestLBPerGroupStrategyOverride(t *testing.T) {
 	rdb := &fakeRedis{zset: map[string]map[string]float64{"hc:g:up": {}}}
 	index := map[string]map[string]config.Target{
@@ -788,7 +843,7 @@ func TestReachableFromAll(t *testing.T) {
 
 func TestBuildLBResponseBasicFields(t *testing.T) {
 	pick := probeResult{Reachable: true, Target: "t1", TargetMeta: targetMeta{Name: "t1", URL: "https://t1"}}
-	resp := buildLBResponse("g", true, "", &pick, nil)
+	resp := buildLBResponse("g", true, "", "none", "cache", &pick, nil)
 	if resp["group"] != "g" || resp["name"] != "t1" || resp["url"] != "https://t1" {
 		t.Fatalf("unexpected response: %#v", resp)
 	}
@@ -798,7 +853,7 @@ func TestBuildLBResponseBasicFields(t *testing.T) {
 }
 
 func TestBuildLBResponseWithError(t *testing.T) {
-	resp := buildLBResponse("g", false, "some error", nil, nil)
+	resp := buildLBResponse("g", false, "some error", "redis_error", "redis_hgetall_error", nil, nil)
 	if resp["error"] != "some error" {
 		t.Fatalf("expected error field, got %#v", resp)
 	}

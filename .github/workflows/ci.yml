@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Go unit tests
+        run: go test ./...
+      - name: Pybench unit tests
+        run: python3 -m unittest discover -s scripts/bench/pybench/tests -p "test_*.py"
+
+  bench_smoke:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Docker info
+        run: docker version
+      - name: Strict smoke massive
+        env:
+          PYBENCH_PROFILE: strict
+          MASSIVE_REPORTS_DIR: ${{ runner.temp }}/ha-bench-smoke
+        run: |
+          python3 -m scripts.bench.pybench.cli massive --tests "health leader api"
+          python3 scripts/bench/pybench/ci_gate.py "${MASSIVE_REPORTS_DIR}/massive-summary.json" --max-fail 0 --max-warn 0
+
+  release_gate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: bench_smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Strict full massive gate
+        env:
+          PYBENCH_PROFILE: strict
+          MASSIVE_REPORTS_DIR: ${{ runner.temp }}/ha-bench-release
+        run: |
+          python3 -m scripts.bench.pybench.cli massive
+          python3 scripts/bench/pybench/ci_gate.py "${MASSIVE_REPORTS_DIR}/massive-summary.json" --max-fail 0 --max-warn 0

@@ -9,12 +9,19 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"ha/config"
+)
+
+var (
+	probeInflightSem chan struct{}
+	probeSemOnce     sync.Once
 )
 
 // StartHTTPGroup launches one goroutine per HTTP target and returns a
@@ -73,6 +80,15 @@ func buildHTTPClient(target config.Target) *http.Client {
 }
 
 func runHTTPLoop(ctx context.Context, group string, target config.Target, rdb RedisSet, tracker *groupTracker, client *http.Client) {
+	probeSemOnce.Do(func() {
+		size := 64
+		if raw := os.Getenv("PROBE_MAX_INFLIGHT"); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+				size = parsed
+			}
+		}
+		probeInflightSem = make(chan struct{}, size)
+	})
 	jitter := jitterDuration(target.Interval, target.JitterPct)
 	timer := time.NewTimer(jitter)
 	defer timer.Stop()
@@ -81,9 +97,15 @@ func runHTTPLoop(ctx context.Context, group string, target config.Target, rdb Re
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			select {
+			case probeInflightSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			start := time.Now()
 			slog.Debug("http probe start", "group", group, "target", target.Name, "url", target.URL)
 			result := runHTTPProbe(ctx, target, client)
+			<-probeInflightSem
 			slog.Debug("http probe result", "group", group, "target", target.Name, "reachable", result.Reachable, "status", result.Status, "latency_ms", result.LatencyMs, "err", result.Error)
 			recordProbe("http")
 			writeStart := time.Now()
@@ -181,7 +203,11 @@ func tryHTTP(parent context.Context, target config.Target, client *http.Client) 
 			cancel()
 		}
 		if i < attempts-1 {
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}
 	return lastErr

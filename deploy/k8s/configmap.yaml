@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ha-config
+  labels:
+    app.kubernetes.io/name: ha
+data:
+  config-targets.yaml: |
+    default:
+      interval: 10s
+      timeout: 2s
+      redisTTL: 15s
+      retry: 0
+    checks:
+      web-health:
+        type: http
+        lb:
+          type: random
+        targets:
+          - name: web-health
+            url: https://example.com/health

@@ -27,6 +27,9 @@ type RedisClient interface {
 type LeaderStatus struct {
 	Leader       bool
 	ProbesActive bool
+	Ready        bool
+	State        string
+	Reason       string
 	NodeID       string
 	Since        time.Time
 }
@@ -59,6 +62,7 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	mux.Handle("/v1/check/", s.checkHandler())
 	mux.Handle("/v1/lb/", s.lbHandler())
 	mux.Handle("/v1/leader", s.leaderHandler())
+	mux.Handle("/ready", s.readyHandler())
 	mux.Handle("/metrics", metricsHandler())
 	mux.Handle("/health", healthHandler())
 	handler := httpLoggingMiddleware(mux)
@@ -129,7 +133,9 @@ type lbResponse map[string]any
 type leaderResponse struct {
 	Leader       bool   `json:"leader"`
 	ProbesActive bool   `json:"probes_active"`
+	Ready        bool   `json:"ready"`
 	Status       string `json:"status"`
+	Reason       string `json:"reason,omitempty"`
 	NodeID       string `json:"node_id,omitempty"`
 	SinceUnix    int64  `json:"since_unix,omitempty"`
 }

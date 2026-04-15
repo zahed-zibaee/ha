@@ -85,6 +85,7 @@ go test ./...
 | `GET` | `/v1/check/{group}` | Informational per-target probe state; returns `redis_status=error` when Redis read fails. |
 | `GET` | `/v1/lb/{group}` | Primary app endpoint; picks one target using strategy + Redis + cache + config fallback. |
 | `GET` | `/v1/leader` | Redis lock + probe state: `leader`, `probes_active`, `status` (`leader` / `follower` / `degraded`), `node_id`, `since_unix`. |
+| `GET` | `/ready` | Readiness gate for orchestration; returns `200` only when node is ready to serve traffic. |
 | `GET` | `/metrics` | Prometheus metrics. |
 | `GET` | `/health` | Liveness only: always `200` with `{"status":"ok"}` while process is up. |
 
@@ -164,17 +165,88 @@ Reference deployment intentionally keeps Redis simple (single instance in Compos
 
 ---
 
-## Bench and resilience scripts
+## Reliability Contract (SLO targets)
 
-Scripts live in `scripts/bench/tests/` and share logic in `scripts/bench/lib/common.sh`.
+These are the default release gates for critical environments:
 
-Highlights:
+- `/v1/lb` availability during chaos/load window: **>= 99.9%**
+- leader convergence after kill/restart: **<= 15s** target, **<= 30s** hard fail
+- transient error rate under resilience scenarios: **<= 1.0% strict**, **<= 5.0% pragmatic**
+- no process-level crash on Redis outage; degraded serving is expected
 
-- `resilience.sh` - restart/kill scenarios
-- `chaos.sh` - random replica/Redis disruptions
-- `churn.sh` - load while leader changes
-- `consistency.sh` - with Redis up, only the lock holder increments probes; with Redis check errors, expects all replicas to probe
-- `dns_failover.sh`, `full_restart.sh`, `leader_kill_during_probes.sh`, `concurrent_chaos_load.sh`
+Runtime coordination knobs:
+
+- `LOCK_TTL` (default `10s`)
+- `LOCK_RENEW_EVERY` (default `5s`)
+- `LOCK_REDIS_TIMEOUT` (default `2s`)
+- `LOCK_REDIS_MAX_RETRIES` (default `3`)
+- `LOCK_REDIS_BACKOFF_MIN` (default `100ms`)
+- `LOCK_REDIS_BACKOFF_MAX` (default `700ms`)
+
+Readiness/liveness behavior:
+
+- `/health` remains liveness-only.
+- `/ready` is orchestration readiness and returns `503` while initializing or unsafe to receive traffic.
+
+---
+
+## Bench and resilience (Python-first)
+
+The bench harness now lives in `scripts/bench/pybench/` and is fully Python-driven.
+
+Quick commands:
+
+```bash
+# list all scenarios
+python3 -m scripts.bench.pybench.cli list
+
+# run one scenario
+python3 -m scripts.bench.pybench.cli run --scenario consistency
+
+# run the full suite (massive)
+python3 -m scripts.bench.pybench.cli massive
+```
+
+Core coverage includes:
+
+- consistency and leadership checks (`consistency`, `leader`)
+- API/health/load-balance validation (`api`, `health`, `loadbalancer`, `distribution`)
+- load and latency (`latency`, `concurrency`)
+- resilience and chaos (`resilience`, `redis_flap`, `churn`, `chaos`, `concurrent_chaos_load`)
+- failover/restart and multi-group (`dns_failover`, `leader_kill_during_probes`, `full_restart`, `multi_group`, `multi_group_stress`)
+- runtime leak check (`goroutine_leak`)
+
+Useful tuning knobs for noisy environments:
+
+- `BENCH_ENDPOINT_FETCH_RETRIES` (default `2`) and `BENCH_ENDPOINT_MAX_TIME` (default `3`) control per-endpoint retry/timeout.
+- `WAIT_LEADER_TIMEOUT`, `WAIT_CHECKS_TIMEOUT`, and `BENCH_WAIT_URL_TRIES` adjust readiness windows.
+- `STRESS_MAX_ERROR_PCT` controls tolerated transient error rate in stress scenarios.
+- `MASSIVE_TESTS` can run a subset during full-suite invocation.
+- `PYBENCH_PROFILE=pragmatic|strict` switches policy profile.
+- `PYBENCH_STRICT=true` enables strict release behavior (includes fail-on-warn and strict replica health).
+- `PYBENCH_FAIL_ON_WARN=true` promotes warning scenarios to failure.
+
+Massive output is structured per scenario (`run.json`, `events.jsonl`, `checks.json`, `summary.txt`, `summary.json`, `attachments/`) and includes run-level rollups (`massive-summary.txt`, `massive-summary.json`).
+
+Analysis helper:
+
+```bash
+python3 scripts/bench/tools/massive_analyze.py /tmp/ha-bench-massive-XXXXXX
+python3 scripts/bench/tools/massive_analyze.py /tmp/ha-bench-massive-XXXXXX --json
+```
+
+Point it at the reports directory printed by the `massive` command.
+
+---
+
+## Deployment Profiles
+
+- Docker reference: `docker-compose.yml`
+- Kubernetes manifests: `deploy/k8s/`
+- Service mode template: `deploy/systemd/ha.service`
+- Deployment notes: `deploy/README.md`
+
+Use `/ready` for readiness probes and `/health` for liveness probes.
 
 ---
 

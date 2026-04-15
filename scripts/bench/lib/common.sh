@@ -15,6 +15,7 @@ bench_defaults() {
 	: "${BASE_URL:=}"
 	: "${CONCURRENCY:=50}"
 	: "${DURATION:=30s}"
+	: "${BENCH_SIEGE_TIMEOUT:=}"
 	: "${STOP_TARGET:=leader}"
 	: "${BUILD:=true}"
 	: "${RESTART_STOPPED:=true}"
@@ -39,6 +40,10 @@ bench_defaults() {
 	: "${BENCH_REPLICA_URL_MODE:=auto}"
 	: "${BENCH_DOCKER_PUBLISH_BIND:=127.0.0.1}"
 	: "${BENCH_WAIT_URL_TRIES:=45}"
+	: "${WAIT_REPLICA_TIMEOUT:=45}"
+	: "${BENCH_METRICS_MAX_TIME:=3}"
+	: "${BENCH_METRICS_FETCH_RETRIES:=3}"
+	: "${BENCH_METRICS_FETCH_DELAY:=1}"
 }
 
 bench_now_ts() {
@@ -51,6 +56,80 @@ bench_test_name() {
 		return
 	fi
 	basename "$0" .sh
+}
+
+bench_duration_seconds() {
+	local raw="${1:-${DURATION:-0}}"
+	if [[ "$raw" =~ ^([0-9]+):([0-9]{2}):([0-9]{2})$ ]]; then
+		echo $((10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 + 10#${BASH_REMATCH[3]}))
+		return
+	fi
+	if [[ "$raw" =~ ^([0-9]+)([sSmMhH]?)$ ]]; then
+		local value="${BASH_REMATCH[1]}"
+		local unit="${BASH_REMATCH[2],,}"
+		case "$unit" in
+			""|s)
+				echo "$value"
+				;;
+			m)
+				echo $((value * 60))
+				;;
+			h)
+				echo $((value * 3600))
+				;;
+			*)
+				echo "$value"
+				;;
+		esac
+		return
+	fi
+	echo 0
+}
+
+bench_siege_timeout_seconds() {
+	local override="${1:-${BENCH_SIEGE_TIMEOUT:-}}"
+	if [[ -n "$override" ]]; then
+		if [[ "$override" =~ ^[0-9]+$ ]]; then
+			echo "$override"
+			return
+		fi
+		local override_seconds
+		override_seconds="$(bench_duration_seconds "$override")"
+		if [[ "$override_seconds" -gt 0 ]]; then
+			echo "$override_seconds"
+			return
+		fi
+	fi
+	local duration_seconds
+	duration_seconds="$(bench_duration_seconds "${DURATION:-0}")"
+	if [[ "$duration_seconds" -le 0 ]]; then
+		duration_seconds=30
+	fi
+	echo $((duration_seconds + 30))
+}
+
+run_siege_capture() {
+	local url="$1"
+	local out="$2"
+	local timeout_seconds="${3:-$(bench_siege_timeout_seconds)}"
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "${timeout_seconds}s" siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 || true
+		return
+	fi
+	siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 &
+	local siege_pid=$!
+	(
+		sleep "$timeout_seconds"
+		if kill -0 "$siege_pid" >/dev/null 2>&1; then
+			kill "$siege_pid" >/dev/null 2>&1 || true
+			sleep 5
+			kill -9 "$siege_pid" >/dev/null 2>&1 || true
+		fi
+	) &
+	local watchdog_pid=$!
+	wait "$siege_pid" || true
+	kill "$watchdog_pid" >/dev/null 2>&1 || true
+	wait "$watchdog_pid" >/dev/null 2>&1 || true
 }
 
 bench_usage() {
@@ -252,6 +331,18 @@ replica_name() {
 	echo "${REPLICA_CONTAINERS[$idx]:-}"
 }
 
+replica_name_for_url() {
+	local target="$1"
+	local idx
+	for idx in "${!REPLICA_URLS[@]}"; do
+		if [[ "${REPLICA_URLS[$idx]}" == "$target" ]]; then
+			echo "${REPLICA_CONTAINERS[$idx]}"
+			return
+		fi
+	done
+	echo ""
+}
+
 replica_count() {
 	echo "${#REPLICA_CONTAINERS[@]}"
 }
@@ -385,6 +476,37 @@ pick_live_base_url() {
 	echo "$BASE_URL"
 }
 
+pick_live_base_url_excluding() {
+	local exclude="$1"
+	local prefer="${2:-}"
+	local idx
+	if [[ -n "$prefer" && "$prefer" != "$exclude" ]]; then
+		idx="$(index_of_replica "$prefer")"
+		if [[ "$idx" -ge 0 ]]; then
+			local preferred_url="${REPLICA_URLS[$idx]}"
+			if curl -fsS --max-time 2 "$preferred_url/health" >/dev/null 2>&1; then
+				echo "$preferred_url"
+				return
+			fi
+		fi
+	fi
+	for idx in "${!REPLICA_URLS[@]}"; do
+		local name="${REPLICA_CONTAINERS[$idx]}"
+		local url="${REPLICA_URLS[$idx]}"
+		if [[ -n "$exclude" && "$name" == "$exclude" ]]; then
+			continue
+		fi
+		if is_replica_stopped "$name"; then
+			continue
+		fi
+		if curl -fsS --max-time 2 "$url/health" >/dev/null 2>&1; then
+			echo "$url"
+			return
+		fi
+	done
+	pick_live_base_url "$prefer"
+}
+
 base_url_healthy() {
 	local url="${1:-$BASE_URL}"
 	if [[ -z "$url" ]]; then
@@ -474,6 +596,31 @@ wait_for_url() {
 			return 0
 		fi
 		sleep 1
+	done
+	return 1
+}
+
+wait_for_all_replicas_health() {
+	local tries="${WAIT_REPLICA_TIMEOUT:-45}"
+	for _ in $(seq 1 "$tries"); do
+		if [[ "${#REPLICA_URLS[@]}" -eq 0 ]]; then
+			discover_replicas 2>/dev/null || true
+			sleep 1
+			continue
+		fi
+		local ready=1
+		local idx
+		for idx in "${!REPLICA_URLS[@]}"; do
+			if ! curl -fsS --max-time 2 "${REPLICA_URLS[$idx]}/health" >/dev/null 2>&1; then
+				ready=0
+				break
+			fi
+		done
+		if [[ "$ready" -eq 1 ]]; then
+			return 0
+		fi
+		sleep 1
+		discover_replicas 2>/dev/null || true
 	done
 	return 1
 }
@@ -869,6 +1016,33 @@ metrics_snapshot() {
 	echo "${req_total}|${req_hit}|${req_miss}|${err_total}|${check_total}|${check_targets}|${probe_runs}"
 }
 
+metrics_body_for_replica() {
+	local name="$1"
+	local retries="${BENCH_METRICS_FETCH_RETRIES:-3}"
+	local delay="${BENCH_METRICS_FETCH_DELAY:-1}"
+	local max_time="${BENCH_METRICS_MAX_TIME:-3}"
+	local attempt body=""
+	for attempt in $(seq 1 "$retries"); do
+		local idx
+		idx="$(index_of_replica "$name")"
+		if [[ "$idx" -lt 0 ]]; then
+			break
+		fi
+		local url="${REPLICA_URLS[$idx]}/metrics"
+		body="$(curl -sS --max-time "$max_time" "$url" || true)"
+		if [[ -n "$body" ]]; then
+			printf '%s' "$body"
+			return 0
+		fi
+		if [[ "$attempt" -lt "$retries" ]]; then
+			sleep "$delay"
+			discover_replicas 2>/dev/null || true
+		fi
+	done
+	printf '%s' "$body"
+	return 1
+}
+
 probe_metrics() {
 	local label="$1"
 	if [[ "$METRICS" != "true" ]]; then
@@ -888,7 +1062,11 @@ probe_metrics() {
 		fi
 		local url="${base}/metrics"
 		local body
-		body="$(curl -sS --max-time 2 "$url" || true)"
+		if [[ "$stopped" -eq 0 ]]; then
+			body="$(metrics_body_for_replica "$name" || true)"
+		else
+			body="$(curl -sS --max-time "${BENCH_METRICS_MAX_TIME:-3}" "$url" || true)"
+		fi
 		if [[ -z "$body" ]]; then
 			echo "metrics ${name}: (no data)" | tee -a "$report"
 			if [[ "$stopped" -eq 0 ]]; then
@@ -957,8 +1135,10 @@ run_siege() {
 		return 0
 	fi
 	echo "" | tee -a "$report"
-	echo "running siege ${label}: $url" | tee -a "$report"
-	siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 || true
+	local timeout_seconds
+	timeout_seconds="$(bench_siege_timeout_seconds)"
+	echo "running siege ${label}: $url (timeout=${timeout_seconds}s)" | tee -a "$report"
+	run_siege_capture "$url" "$out" "$timeout_seconds"
 	echo "siege output: $out" | tee -a "$report"
 	local trx rate resp
 	trx="$(rg -m1 "\"transactions\"" "$out" || true)"
@@ -1046,6 +1226,14 @@ bench_prepare() {
 	bench_require_cmds
 	bench_compose_up
 	bench_discover
+	echo "waiting for all replica health endpoints..." | tee -a "$report"
+	if ! wait_for_all_replicas_health; then
+		echo "not all replicas became healthy in time" | tee -a "$report"
+		record_failure "replicas did not become healthy on start"
+		add_check "api" "replicas healthy (startup)" "fail"
+	else
+		add_check "api" "replicas healthy (startup)" "pass"
+	fi
 	bench_collect_groups
 	bench_wait_lb
 	bench_stabilize

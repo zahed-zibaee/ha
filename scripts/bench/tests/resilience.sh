@@ -81,9 +81,9 @@ run_resilience() {
 		echo "leader after (logs): ${leader_after:-unknown}" | tee -a "$report"
 	fi
 
-	if [[ -n "$stopped" && "$stopped" == "$(echo "$BASE_URL" | sed -n 's#http://\([^:]*\).*#\1#p')" ]]; then
+	if [[ -n "$stopped" && "$stopped" == "$(replica_name_for_url "$BASE_URL")" ]]; then
 		local new_base
-		new_base="$(pick_live_base_url "$leader_after")"
+		new_base="$(pick_live_base_url_excluding "$stopped" "$leader_after")"
 		if [[ "$new_base" != "$BASE_URL" ]]; then
 			echo "base url moved from ${BASE_URL} to ${new_base}" | tee -a "$report"
 			BASE_URL="$new_base"

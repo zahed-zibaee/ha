@@ -69,6 +69,13 @@ run_test() {
 
 tmp_dir="$(mktemp -d -t ha-bench-massive-XXXXXX)"
 declare -a tests reports statuses summaries overalls failures durations
+tests=()
+reports=()
+statuses=()
+summaries=()
+overalls=()
+failures=()
+durations=()
 
 echo "" >&2
 echo "massive: running ${MASSIVE_TESTS// /, }" >&2

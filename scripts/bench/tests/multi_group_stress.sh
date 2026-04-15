@@ -15,12 +15,38 @@ source "$ROOT_DIR/scripts/bench/lib/common.sh"
 : "${STRESS_CHAOS_INTERVAL:=6}"
 : "${STRESS_CHAOS_STEPS:=5}"
 : "${STRESS_MAX_ERROR_PCT:=15}"
+: "${STRESS_RECOVERY_WAIT:=20}"
 # Default 0: stopping Redis during load causes most LB requests to fail; set e.g. 20 to include Redis chaos.
 : "${STRESS_REDIS_FLAP_PROB:=0}"
 
 bench_defaults
 bench_parse_args "$@"
 bench_prepare
+EXPECTED_REPLICAS="$(replica_count)"
+
+wait_for_replica_metrics() {
+	local expected="${1:-$EXPECTED_REPLICAS}"
+	for _ in $(seq 1 "$STRESS_RECOVERY_WAIT"); do
+		discover_replicas 2>/dev/null || true
+		if [[ "${#REPLICA_URLS[@]}" -lt "$expected" ]]; then
+			sleep 1
+			continue
+		fi
+		local ready=1
+		local idx
+		for idx in "${!REPLICA_URLS[@]}"; do
+			if ! metrics_body_for_replica "${REPLICA_CONTAINERS[$idx]}" >/dev/null 2>&1; then
+				ready=0
+				break
+			fi
+		done
+		if [[ "$ready" -eq 1 && "${#REPLICA_URLS[@]}" -gt 0 ]]; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
 
 echo "multi_group_stress: settling for ${STRESS_SETTLE}s" | tee -a "$report"
 sleep "$STRESS_SETTLE"
@@ -213,5 +239,11 @@ else
 	add_check "stress" "post-stress recovery" "fail" "${groups_ok}/${#groups[@]}"
 fi
 
+if ! wait_for_all_replicas_health; then
+	echo "multi_group_stress: not every replica became healthy before final metrics probe" | tee -a "$report"
+fi
+if ! wait_for_replica_metrics "$EXPECTED_REPLICAS"; then
+	echo "multi_group_stress: metrics did not settle on every replica before final probe" | tee -a "$report"
+fi
 probe_metrics "multi_group_stress final"
 bench_finish

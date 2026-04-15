@@ -28,6 +28,14 @@ else
 	add_check "steps" "compose start" "pass"
 fi
 bench_discover
+echo "waiting for all replica health endpoints..." | tee -a "$report"
+if ! wait_for_all_replicas_health; then
+	echo "not all replicas became healthy in time" | tee -a "$report"
+	record_failure "replicas did not become healthy: cold start"
+	add_check "api" "replicas healthy" "fail"
+else
+	add_check "api" "replicas healthy" "pass"
+fi
 bench_collect_groups
 bench_wait_lb
 

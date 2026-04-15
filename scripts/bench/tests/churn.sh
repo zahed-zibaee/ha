@@ -7,11 +7,12 @@ source "$ROOT_DIR/scripts/bench/lib/common.sh"
 : "${CHURN_STOP_DELAY:=5}"
 : "${CHURN_RESTART_DELAY:=10}"
 : "${CHURN_PROGRESS_INTERVAL:=15}"
-: "${CHURN_SIEGE_TIMEOUT:=120}"
+: "${CHURN_SIEGE_TIMEOUT:=}"
 : "${CHURN_KILL_GRACE:=5}"
 
 bench_defaults
 bench_parse_args "$@"
+: "${CHURN_SIEGE_TIMEOUT:=$(bench_siege_timeout_seconds)}"
 bench_prepare
 
 if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
@@ -32,6 +33,15 @@ if [[ -z "$leader_before" ]]; then
 	leader_before="$(detect_leader)"
 fi
 
+base_replica="$(replica_name_for_url "$BASE_URL")"
+if [[ -n "$leader_before" && "$base_replica" == "$leader_before" ]]; then
+	alt_base="$(pick_live_base_url_excluding "$leader_before")"
+	if [[ -n "$alt_base" && "$alt_base" != "$BASE_URL" ]]; then
+		echo "churn: moving load base from ${BASE_URL} to ${alt_base} so the leader stop does not target the active load endpoint" | tee -a "$report"
+		BASE_URL="$alt_base"
+	fi
+fi
+
 if ! command -v siege >/dev/null 2>&1; then
 	add_check "load" "churn load" "warn" "siege not installed"
 	bench_finish
@@ -40,7 +50,7 @@ fi
 
 out="$OUT_DIR/siege-churn.txt"
 url="${BASE_URL}/v1/lb/${GROUP}"
-echo "running siege churn: $url" | tee -a "$report"
+echo "running siege churn: $url (timeout=${CHURN_SIEGE_TIMEOUT}s)" | tee -a "$report"
 if command -v timeout >/dev/null 2>&1; then
 	timeout "${CHURN_SIEGE_TIMEOUT}s" siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 &
 	siege_pid=$!
@@ -104,9 +114,9 @@ if [[ -n "$progress_pid" ]]; then
 	wait "$progress_pid" >/dev/null 2>&1 || true
 fi
 
-trx="$(rg -m1 '"transactions"' "$out" | sed 's/[^0-9.]//g')"
-rate="$(rg -m1 '"transaction_rate"' "$out" | sed 's/[^0-9.]//g')"
-resp="$(rg -m1 '"response_time"' "$out" | sed 's/[^0-9.]//g')"
+trx="$(rg -m1 '"transactions"' "$out" | sed 's/[^0-9.]//g' || true)"
+rate="$(rg -m1 '"transaction_rate"' "$out" | sed 's/[^0-9.]//g' || true)"
+resp="$(rg -m1 '"response_time"' "$out" | sed 's/[^0-9.]//g' || true)"
 if [[ -n "$trx" || -n "$rate" || -n "$resp" ]]; then
 	if [[ "${trx:-0}" != "0" ]]; then
 		add_check "load" "churn load" "pass" "trx=${trx:-0} rate=${rate:-0} resp=${resp:-0}"

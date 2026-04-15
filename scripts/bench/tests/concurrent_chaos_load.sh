@@ -8,11 +8,14 @@ source "$ROOT_DIR/scripts/bench/lib/common.sh"
 : "${CHAOS_LOAD_CONCURRENCY:=100}"
 : "${CHAOS_KILL_INTERVAL:=5}"
 : "${CHAOS_KILL_COUNT:=4}"
+: "${CHAOS_LOAD_SIEGE_TIMEOUT:=}"
+: "${CHAOS_LOAD_MAX_ERROR_PCT:=5}"
 
 bench_defaults
 DURATION="$CHAOS_LOAD_DURATION"
 CONCURRENCY="$CHAOS_LOAD_CONCURRENCY"
 bench_parse_args "$@"
+: "${CHAOS_LOAD_SIEGE_TIMEOUT:=$(bench_siege_timeout_seconds)}"
 bench_prepare
 
 if [[ "$WAIT_FOR_LEADER" == "true" ]]; then
@@ -35,14 +38,35 @@ else
 fi
 
 out="$OUT_DIR/siege-concurrent-chaos.txt"
+BASE_URL="$(pick_live_base_url "")"
+load_replica="$(replica_name_for_url "$BASE_URL")"
 url="${BASE_URL}/v1/lb/${GROUP}"
-echo "concurrent_chaos: starting load against ${url}" | tee -a "$report"
+echo "concurrent_chaos: starting load against ${url} (timeout=${CHAOS_LOAD_SIEGE_TIMEOUT}s load_replica=${load_replica:-unknown})" | tee -a "$report"
+load_watchdog_pid=""
 if [[ "$use_curl" -eq 0 ]]; then
-	siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 &
-	load_pid=$!
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "${CHAOS_LOAD_SIEGE_TIMEOUT}s" siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 &
+		load_pid=$!
+	else
+		siege -c "${CONCURRENCY}" -t "${DURATION}" "$url" >"$out" 2>&1 &
+		load_pid=$!
+		(
+			sleep "$CHAOS_LOAD_SIEGE_TIMEOUT"
+			if kill -0 "$load_pid" >/dev/null 2>&1; then
+				kill "$load_pid" >/dev/null 2>&1 || true
+				sleep 5
+				kill -9 "$load_pid" >/dev/null 2>&1 || true
+			fi
+		) &
+		load_watchdog_pid=$!
+	fi
 else
 	(
-		end_time=$((SECONDS + 30))
+		duration_seconds="$(bench_duration_seconds "$DURATION")"
+		if [[ "$duration_seconds" -le 0 ]]; then
+			duration_seconds=30
+		fi
+		end_time=$((SECONDS + duration_seconds))
 		success=0
 		fail=0
 		while [[ $SECONDS -lt $end_time ]]; do
@@ -64,9 +88,16 @@ for step in $(seq 1 "$CHAOS_KILL_COUNT"); do
 	echo "concurrent_chaos: kill cycle ${step}" | tee -a "$report"
 
 	read -r -a running_list <<< "$(running_replicas)"
-	if [[ "${#running_list[@]}" -gt 1 ]]; then
-		idx=$((RANDOM % ${#running_list[@]}))
-		victim="${running_list[$idx]}"
+	eligible=()
+	for replica in "${running_list[@]}"; do
+		if [[ -n "${load_replica:-}" && "$replica" == "$load_replica" ]]; then
+			continue
+		fi
+		eligible+=("$replica")
+	done
+	if [[ "${#eligible[@]}" -gt 0 ]]; then
+		idx=$((RANDOM % ${#eligible[@]}))
+		victim="${eligible[$idx]}"
 		echo "concurrent_chaos: stopping ${victim}" | tee -a "$report"
 		stop_replica "$victim"
 		add_check "steps" "chaos stop ${victim} cycle ${step}" "pass"
@@ -85,6 +116,10 @@ for step in $(seq 1 "$CHAOS_KILL_COUNT"); do
 done
 
 wait "$load_pid" || true
+if [[ -n "$load_watchdog_pid" ]]; then
+	kill "$load_watchdog_pid" >/dev/null 2>&1 || true
+	wait "$load_watchdog_pid" >/dev/null 2>&1 || true
+fi
 
 if [[ "$use_curl" -eq 0 && -f "$out" ]]; then
 	trx="$(rg -m1 '"transactions"' "$out" | sed 's/[^0-9.]//g' || true)"
@@ -96,7 +131,7 @@ if [[ "$use_curl" -eq 0 && -f "$out" ]]; then
 	if [[ -n "$trx" && "${trx:-0}" != "0" ]]; then
 		err_pct="$(awk -v f="${failed:-0}" -v t="$trx" 'BEGIN{if(t>0) printf "%.2f", (f/t)*100; else print "100"}')"
 		echo "concurrent_chaos: error rate ${err_pct}%" | tee -a "$report"
-		if awk -v e="$err_pct" 'BEGIN{exit !(e < 5)}'; then
+		if awk -v e="$err_pct" -v limit="$CHAOS_LOAD_MAX_ERROR_PCT" 'BEGIN{exit !(e < limit)}'; then
 			add_check "load" "concurrent chaos load" "pass" "trx=${trx} err%=${err_pct}"
 		else
 			record_failure "concurrent chaos error rate too high: ${err_pct}%"

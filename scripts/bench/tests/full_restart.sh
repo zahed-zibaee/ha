@@ -40,6 +40,13 @@ echo "full_restart: bringing cluster back up" | tee -a "$report"
 bench_compose_up
 sleep 5
 bench_discover
+echo "waiting for all replica health endpoints after restart..." | tee -a "$report"
+if ! wait_for_all_replicas_health; then
+	record_failure "replicas did not become healthy after full restart"
+	add_check "api" "replicas healthy after restart" "fail"
+else
+	add_check "api" "replicas healthy after restart" "pass"
+fi
 bench_collect_groups
 
 echo "full_restart: waiting for cluster to reform..." | tee -a "$report"

@@ -38,20 +38,20 @@ checks:
         response: 200,204
     lb:
       type: round-robin # round-robin | random | weighted (latency-based) | weighted-rr
-      response_targets:
-        # Customize /v1/lb response per target. The response is flattened.
+      target_group_responses:
+        # Customize /v1/lb response per target group, then per target.
         # Response always includes group, reachable, name, and error (if any).
-        # If response map is present, it replaces target data fields.
-        - name: full-http-example1
-          response:
-            url: https://example.com/home-page
-            bucket: my-bucket
-            description: "Example override for target 1"
-        - name: full-http-example2
-          response:
-            url: https://example.com/my-page
-            bucket: my-bucket
-            description: "Example override for target 2"
+        - web-health:
+            - name: full-http-example1
+              response:
+                url: https://example.com/home-page
+                bucket: my-bucket
+                description: "Example override for target 1"
+            - name: full-http-example2
+              response:
+                url: https://example.com/my-page
+                bucket: my-bucket
+                description: "Example override for target 2"
         
 
 # Planned (not implemented yet): bucket/object/tcp/dns/ping/tls/grpc checks.

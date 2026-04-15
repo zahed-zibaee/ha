@@ -97,3 +97,109 @@ checks:
 		t.Fatalf("expected validation error for unknown type")
 	}
 }
+
+func TestLoadTargetGroupResponses(t *testing.T) {
+	yml := `
+checks:
+  web:
+    type: http
+    targets:
+      - name: shared
+        url: https://web.example.com
+    lb:
+      target_group_responses:
+        - web:
+            - name: shared
+              response:
+                url: https://public-web.example.com
+  api:
+    type: http
+    targets:
+      - name: shared
+        url: https://api.example.com
+    lb:
+      target_group_responses:
+        - api:
+            - name: shared
+              response:
+                url: https://public-api.example.com
+`
+	path := writeTempConfig(t, yml)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if got := cfg.Checks["web"].LB.TargetGroupResponses[0].TargetGroup; got != "web" {
+		t.Fatalf("web target group = %q, want %q", got, "web")
+	}
+	if got := cfg.Checks["web"].LB.TargetGroupResponses[0].Targets[0].Name; got != "shared" {
+		t.Fatalf("web target name = %q, want %q", got, "shared")
+	}
+	if got := cfg.Checks["api"].LB.TargetGroupResponses[0].TargetGroup; got != "api" {
+		t.Fatalf("api target group = %q, want %q", got, "api")
+	}
+}
+
+func TestLoadRejectsUnknownLBTargetGroupResponsesGroup(t *testing.T) {
+	yml := `
+checks:
+  web:
+    type: http
+    targets:
+      - name: a
+        url: https://example.com
+    lb:
+      target_group_responses:
+        - missing:
+            - name: a
+              response:
+                url: https://public.example.com
+`
+	path := writeTempConfig(t, yml)
+	if _, err := Load(path); err == nil {
+		t.Fatalf("expected validation error for unknown lb target group")
+	}
+}
+
+func TestLoadRejectsUnknownLBTargetGroupResponsesTargetName(t *testing.T) {
+	yml := `
+checks:
+  web:
+    type: http
+    targets:
+      - name: a
+        url: https://example.com
+    lb:
+      target_group_responses:
+        - web:
+            - name: missing
+              response:
+                url: https://public.example.com
+`
+	path := writeTempConfig(t, yml)
+	if _, err := Load(path); err == nil {
+		t.Fatalf("expected validation error for unknown lb target name")
+	}
+}
+
+func TestLoadRejectsLegacyLBResponseTargets(t *testing.T) {
+	yml := `
+checks:
+  web:
+    type: http
+    targets:
+      - name: a
+        url: https://example.com
+    lb:
+      response_targets:
+        - name: a
+          response:
+            url: https://public.example.com
+`
+	path := writeTempConfig(t, yml)
+	if _, err := Load(path); err == nil {
+		t.Fatalf("expected validation error for legacy response_targets")
+	}
+}

@@ -39,11 +39,25 @@ type CheckConfig struct {
 }
 
 // LBConfig controls load balancer response behavior.
-// Defaults: random selection; when response_targets is empty, /v1/lb uses target meta fields as the response.
+// Defaults: random selection; when target_group_responses is empty, /v1/lb uses target meta fields as the response.
 type LBConfig struct {
-	Type            string             `yaml:"type"`
-	ResponseTargets []LBResponseTarget `yaml:"response_targets"`
-	LegacyTargets   []LBResponseTarget `yaml:"responseTargets"`
+	Type                 string                   `yaml:"type"`
+	TargetGroupResponses []LBTargetGroupResponses `yaml:"target_group_responses"`
+	LegacyFlatTargets    []LBResponseTarget       `yaml:"response_targets"`
+	LegacyTargets        []LBResponseTarget       `yaml:"responseTargets"`
+}
+
+// LBTargetGroupResponses customizes /v1/lb responses for one target group.
+// YAML shape:
+//
+//	target_group_responses:
+//	  - web-health:
+//	      - name: target-a
+//	        response:
+//	          url: https://example.com
+type LBTargetGroupResponses struct {
+	TargetGroup string
+	Targets     []LBResponseTarget
 }
 
 // LBResponseTarget customizes /v1/lb response for a target name.
@@ -119,6 +133,24 @@ func (s *StatusList) UnmarshalYAML(value *yaml.Node) error {
 	default:
 		return fmt.Errorf("status list must be sequence or scalar")
 	}
+}
+
+// UnmarshalYAML accepts a single-entry mapping item inside target_group_responses.
+func (tgr *LBTargetGroupResponses) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("target_group_responses entries must be mappings")
+	}
+	if len(value.Content) != 2 {
+		return fmt.Errorf("target_group_responses entries must contain exactly one target group")
+	}
+	tgr.TargetGroup = strings.TrimSpace(value.Content[0].Value)
+	if tgr.TargetGroup == "" {
+		return fmt.Errorf("target_group_responses entry target group is required")
+	}
+	if err := value.Content[1].Decode(&tgr.Targets); err != nil {
+		return fmt.Errorf("target_group_responses[%s]: %w", tgr.TargetGroup, err)
+	}
+	return nil
 }
 
 // Load reads configuration from YAML at path (or CONFIG_PATH env, or config-targets.yaml) and validates it.
@@ -217,6 +249,7 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("no checks defined")
 	}
 
+	seenLBTargets := make(map[string]string)
 	for groupName, chk := range cfg.Checks {
 		if chk.Type == "" {
 			return fmt.Errorf("check %q: type is required", groupName)
@@ -263,14 +296,42 @@ func validate(cfg *Config) error {
 			}
 		}
 		if len(chk.LB.LegacyTargets) > 0 {
-			return fmt.Errorf("check %q: lb.responseTargets is not supported; use response_targets", groupName)
+			return fmt.Errorf("check %q: lb.responseTargets is not supported; use target_group_responses", groupName)
 		}
-		for i, rt := range chk.LB.ResponseTargets {
-			if strings.TrimSpace(rt.Name) == "" {
-				return fmt.Errorf("check %q: lb.response_targets[%d].name is required", groupName, i)
+		if len(chk.LB.LegacyFlatTargets) > 0 {
+			return fmt.Errorf("check %q: lb.response_targets is not supported; use target_group_responses", groupName)
+		}
+		seenTargetGroups := make(map[string]struct{})
+		for i, groupResp := range chk.LB.TargetGroupResponses {
+			targetGroup := strings.TrimSpace(groupResp.TargetGroup)
+			if targetGroup == "" {
+				return fmt.Errorf("check %q: lb.target_group_responses[%d] target group is required", groupName, i)
 			}
-			if rt.Response == nil {
-				return fmt.Errorf("check %q: lb.response_targets[%d].response is required", groupName, i)
+			if _, ok := seenTargetGroups[targetGroup]; ok {
+				return fmt.Errorf("check %q: lb.target_group_responses duplicates target group %q", groupName, targetGroup)
+			}
+			seenTargetGroups[targetGroup] = struct{}{}
+
+			ref, ok := cfg.Checks[targetGroup]
+			if !ok {
+				return fmt.Errorf("check %q: lb.target_group_responses[%d] target group %q does not match any check group", groupName, i, targetGroup)
+			}
+			for j, rt := range groupResp.Targets {
+				if strings.TrimSpace(rt.Name) == "" {
+					return fmt.Errorf("check %q: lb.target_group_responses[%d].%s[%d].name is required", groupName, i, targetGroup, j)
+				}
+				if rt.Response == nil {
+					return fmt.Errorf("check %q: lb.target_group_responses[%d].%s[%d].response is required", groupName, i, targetGroup, j)
+				}
+				if !hasTarget(ref.Targets, rt.Name) {
+					return fmt.Errorf("check %q: lb.target_group_responses[%d].%s[%d] references unknown target %q", groupName, i, targetGroup, j, rt.Name)
+				}
+				seenKey := targetGroup + "\x00" + rt.Name
+				owner := fmt.Sprintf("%s[%d].%s[%d]", groupName, i, targetGroup, j)
+				if prev, exists := seenLBTargets[seenKey]; exists {
+					return fmt.Errorf("lb.target_group_responses duplicate override for target %q in group %q (%s and %s)", rt.Name, targetGroup, prev, owner)
+				}
+				seenLBTargets[seenKey] = owner
 			}
 		}
 		if chk.LB.Type != "" {
@@ -283,6 +344,15 @@ func validate(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+func hasTarget(targets []Target, name string) bool {
+	for _, t := range targets {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func validateTargetByType(typ, group string, t *Target) error {

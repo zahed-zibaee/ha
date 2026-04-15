@@ -24,16 +24,17 @@ checks:
         response: 200
     lb:
       type: round-robin
-      response_targets:
-        - name: web-ok
-          response:
-            url: http://mock-target/ok
-        - name: web-health
-          response:
-            url: http://mock-target/health
-        - name: web-root
-          response:
-            url: http://mock-target/
+      target_group_responses:
+        - web-health:
+            - name: web-ok
+              response:
+                url: http://mock-target/ok
+            - name: web-health
+              response:
+                url: http://mock-target/health
+            - name: web-root
+              response:
+                url: http://mock-target/
 
   api-health:
     type: http
@@ -57,19 +58,20 @@ checks:
         response: 200
     lb:
       type: random
-      response_targets:
-        - name: api-v1
-          response:
-            url: http://mock-target/api/v1
-        - name: api-v2
-          response:
-            url: http://mock-target/api/v2
-        - name: api-root
-          response:
-            url: http://mock-target/ok
-        - name: api-health
-          response:
-            url: http://mock-target/health
+      target_group_responses:
+        - api-health:
+            - name: api-v1
+              response:
+                url: http://mock-target/api/v1
+            - name: api-v2
+              response:
+                url: http://mock-target/api/v2
+            - name: api-root
+              response:
+                url: http://mock-target/ok
+            - name: api-health
+              response:
+                url: http://mock-target/health
 
   cdn-health:
     type: http
@@ -87,15 +89,16 @@ checks:
         response: 200
     lb:
       type: weighted
-      response_targets:
-        - name: cdn-status
-          response:
-            url: http://mock-target/cdn/status
-            region: us-east
-        - name: cdn-edge
-          response:
-            url: http://mock-target/cdn/edge
-            region: eu-west
+      target_group_responses:
+        - cdn-health:
+            - name: cdn-status
+              response:
+                url: http://mock-target/cdn/status
+                region: us-east
+            - name: cdn-edge
+              response:
+                url: http://mock-target/cdn/edge
+                region: eu-west
 
   internal-health:
     type: http
@@ -122,22 +125,23 @@ checks:
         response: 200
     lb:
       type: round-robin
-      response_targets:
-        - name: ping
-          response:
-            url: http://mock-target/internal/ping
-        - name: ready
-          response:
-            url: http://mock-target/internal/ready
-        - name: live
-          response:
-            url: http://mock-target/internal/live
-        - name: ok
-          response:
-            url: http://mock-target/ok
-        - name: root
-          response:
-            url: http://mock-target/
+      target_group_responses:
+        - internal-health:
+            - name: ping
+              response:
+                url: http://mock-target/internal/ping
+            - name: ready
+              response:
+                url: http://mock-target/internal/ready
+            - name: live
+              response:
+                url: http://mock-target/internal/live
+            - name: ok
+              response:
+                url: http://mock-target/ok
+            - name: root
+              response:
+                url: http://mock-target/
 
   mixed-health:
     type: http
@@ -158,13 +162,14 @@ checks:
         response: 200
     lb:
       type: random
-      response_targets:
-        - name: healthy-1
-          response:
-            url: http://mock-target/ok
-        - name: healthy-2
-          response:
-            url: http://mock-target/health
-        - name: failing
-          response:
-            url: http://mock-target/fail
+      target_group_responses:
+        - mixed-health:
+            - name: healthy-1
+              response:
+                url: http://mock-target/ok
+            - name: healthy-2
+              response:
+                url: http://mock-target/health
+            - name: failing
+              response:
+                url: http://mock-target/fail

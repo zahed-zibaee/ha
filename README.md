@@ -115,6 +115,7 @@ Behavior:
 
 - Strategies: `random` (default), `round-robin`, `weighted`, `weighted-rr`
 - Per-group override: `checks.<group>.lb.type` in YAML
+- `checks.<group>.lb.target_group_responses[]` groups LB response overrides by target group
 - Resolution chain (high-level):
   1. Fresh in-process LB cache
   2. Redis backoff path

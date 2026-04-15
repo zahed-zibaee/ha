@@ -165,25 +165,28 @@ func buildTargetIndex(cfg *config.Config) (map[string]map[string]config.Target, 
 
 func buildLBResponseIndex(cfg *config.Config) map[string]map[string]map[string]any {
 	index := make(map[string]map[string]map[string]any)
-	for group, chk := range cfg.Checks {
-		if len(chk.LB.ResponseTargets) == 0 {
+	for _, chk := range cfg.Checks {
+		if len(chk.LB.TargetGroupResponses) == 0 {
 			continue
 		}
-		if index[group] == nil {
-			index[group] = make(map[string]map[string]any)
-		}
-		for _, rt := range chk.LB.ResponseTargets {
-			if rt.Response == nil {
-				continue
+		for _, groupResp := range chk.LB.TargetGroupResponses {
+			targetGroup := groupResp.TargetGroup
+			if index[targetGroup] == nil {
+				index[targetGroup] = make(map[string]map[string]any)
 			}
-			resp := make(map[string]any, len(rt.Response)+1)
-			for k, v := range rt.Response {
-				resp[k] = v
+			for _, rt := range groupResp.Targets {
+				if rt.Response == nil {
+					continue
+				}
+				resp := make(map[string]any, len(rt.Response)+1)
+				for k, v := range rt.Response {
+					resp[k] = v
+				}
+				if _, ok := resp["name"]; !ok {
+					resp["name"] = rt.Name
+				}
+				index[targetGroup][rt.Name] = resp
 			}
-			if _, ok := resp["name"]; !ok {
-				resp["name"] = rt.Name
-			}
-			index[group][rt.Name] = resp
 		}
 	}
 	return index
